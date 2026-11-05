@@ -106,12 +106,21 @@ def stage_doctor(a):
 
 
 def stage_data(a):
+    """Descarga de la carpeta publica del curso UNA vez y la cachea en TU Drive (--persist/data):
+    las siguientes corridas copian desde tu Drive y no gastan la cuota de descarga del profesor."""
     import gdown
     DATA.mkdir(exist_ok=True)
+    cache = pathlib.Path(a.persist) / "data" if a.persist else None
     for name, fid in DRIVE_IDS.items():
         dst = DATA / name
         if not dst.exists():
-            gdown.download(id=fid, output=str(dst), quiet=False)
+            if cache and (cache / name).exists():
+                print(f"{name}: copiando desde tu Drive (cache)"); shutil.copy(cache / name, dst)
+            else:
+                gdown.download(id=fid, output=str(dst), quiet=False)
+                if cache:
+                    cache.mkdir(parents=True, exist_ok=True); shutil.copy(dst, cache / name)
+                    print(f"{name}: guardado en cache {cache}")
         if name.endswith(".zip") and not (DATA / name[:-4]).exists():
             zipfile.ZipFile(dst).extractall(DATA)
     print("train:", len(list((DATA / "train").glob("*"))), "test:", len(list((DATA / "test").glob("*"))))
