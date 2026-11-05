@@ -45,6 +45,9 @@ def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"), extra=None
         if v: os.environ[n] = v
     if os.environ.get("HF_TOKEN"):
         os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", os.environ["HF_TOKEN"])
+    k = os.environ.get("KAGGLE_KEY", "")
+    if k.startswith("KGAT_"):  # tokens nuevos de Kaggle: se pasan por KAGGLE_API_TOKEN
+        os.environ.setdefault("KAGGLE_API_TOKEN", k)
 
 
 def kaggle_cmd():
@@ -90,6 +93,9 @@ def stage_doctor(a):
         if os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"):
             r = subprocess.run(kaggle_cmd() + ["competitions", "submissions", "-c", COMPETITION],
                                capture_output=True, text=True, cwd=ROOT)
+            k = os.environ.get("KAGGLE_KEY", "")
+            print(f"  info  KAGGLE_USERNAME={os.environ['KAGGLE_USERNAME']!r} (debe ser el usuario exacto de tu perfil); "
+                  f"KAGGLE_KEY: {len(k)} caracteres, formato {'KGAT_ (token nuevo)' if k.startswith('KGAT_') else 'clasico'}")
             chk(f"Kaggle: credenciales validas y unido a '{COMPETITION}'", r.returncode == 0,
                 (r.stderr or r.stdout).strip()[:200])
     if "data" not in a.stages.split(","):
