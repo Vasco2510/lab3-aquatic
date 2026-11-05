@@ -47,6 +47,12 @@ def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"), extra=None
         os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", os.environ["HF_TOKEN"])
 
 
+def kaggle_cmd():
+    """`python -m kaggle` ya no existe en versiones nuevas: usa el ejecutable `kaggle`."""
+    exe = shutil.which("kaggle")
+    return [exe] if exe else [sys.executable, "-c", "from kaggle.cli import main; main()"]
+
+
 def sh(cmd):
     print("$", " ".join(map(str, cmd)), flush=True)
     subprocess.check_call(list(map(str, cmd)), cwd=ROOT)
@@ -82,7 +88,7 @@ def stage_doctor(a):
     if a.submit:
         chk("KAGGLE_USERNAME/KEY", bool(os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")), "faltan en .env")
         if os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"):
-            r = subprocess.run([sys.executable, "-m", "kaggle", "competitions", "submissions", "-c", COMPETITION],
+            r = subprocess.run(kaggle_cmd() + ["competitions", "submissions", "-c", COMPETITION],
                                capture_output=True, text=True, cwd=ROOT)
             chk(f"Kaggle: credenciales validas y unido a '{COMPETITION}'", r.returncode == 0,
                 (r.stderr or r.stdout).strip()[:200])
@@ -175,7 +181,7 @@ def stage_check(a):
 def stage_submit(a):
     if not (os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")):
         sys.exit("Faltan KAGGLE_USERNAME / KAGGLE_KEY")
-    sh([sys.executable, "-m", "kaggle", "competitions", "submit", "-c", COMPETITION,
+    sh(kaggle_cmd() + ["competitions", "submit", "-c", COMPETITION,
         "-f", "outputs/submission.csv", "-m", a.message])
 
 
