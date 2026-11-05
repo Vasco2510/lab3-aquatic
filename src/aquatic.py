@@ -141,7 +141,8 @@ def cmd_train(a):
     best, ep_t = 0, 0
     for ep in range(a.epochs):
         te = time.time(); net.train()
-        for x, y in dl:
+        for bi, (x, y) in enumerate(dl):
+            if a.max_steps and bi >= a.max_steps: break
             x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True); m = random_mask(len(x), device=dev)
             with torch.autocast("cuda", dtype=dt):
                 lg = net(prep(x, m))
@@ -151,7 +152,8 @@ def cmd_train(a):
             scaler.step(opt); scaler.update(); sched.step()
         net.eval(); c = n = 0
         with torch.no_grad():
-            for x, y in dv:
+            for vi, (x, y) in enumerate(dv):
+                if a.max_steps and vi >= a.max_steps: break
                 x, y = x.to(dev), y.to(dev); m = random_mask(len(x), device=dev)
                 with torch.autocast("cuda", dtype=dt):
                     lg = net(prep(x, m))
@@ -175,7 +177,9 @@ def cmd_predict(a):
     for p in paths:
         net = Net(cb, a.unfreeze).to(dev); net.load_state_dict(torch.load(p, map_location=dev)); nets.append(net.eval())
     print("ensamble de", len(nets), "modelos:", paths)
-    tg = pd.read_csv(a.target_csv); imgs = list_images(a.test_dir); rows = []
+    tg = pd.read_csv(a.target_csv)
+    if a.limit: tg = tg.head(a.limit)
+    imgs = list_images(a.test_dir); rows = []
     with torch.no_grad():
         for i, t in zip(tg["ID"].astype(str), tg["target"].astype(str)):
             ps = [int(p) for p in t.split()]
@@ -203,6 +207,7 @@ if __name__ == "__main__":
         p.add_argument("--lr", type=float, default=1e-3); p.add_argument("--unfreeze", type=int, default=4)
         p.add_argument("--seed", type=int, default=0); p.add_argument("--workers", type=int, default=4)
         p.add_argument("--time-budget", type=float, default=0, help="minutos; 0 = sin limite")
+        p.add_argument("--max-steps", type=int, default=0, help="solo prueba: pasos por epoca"); p.add_argument("--limit", type=int, default=0)
         p.add_argument("--persist", default=""); p.add_argument("--test-dir", default="data/test")
         p.add_argument("--resume", action="store_true"); p.add_argument("--target-csv", default="data/target.csv")
         p.add_argument("--out", default="outputs/submission.csv")

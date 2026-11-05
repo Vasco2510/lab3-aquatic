@@ -20,7 +20,7 @@ DRIVE_IDS = {  # carpeta pública del curso
     "codebook.npy": "1Hhjxp23rHuciFSItJiLBP2wfA_AK2Nyw",
     "dino_vq.py": "1SjiA9eAcG8LrW-I6KOtiraJjbjwag8h0",
 }
-STAGES = ["data", "labels", "train", "predict", "check", "submit"]
+STAGES = ["data", "labels", "preflight", "train", "predict", "check", "submit"]
 
 
 def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY")):
@@ -75,6 +75,18 @@ PRESETS = {  # --preset; cualquier flag explicito lo sobreescribe
     "full":  dict(epochs=15, seeds=1, unfreeze=4),
     "night": dict(epochs=20, seeds=3, unfreeze=6, hours=8),  # ensamble de 3 semillas, con tope de tiempo
 }
+
+
+def stage_preflight(a):
+    """Prueba de humo automatica (segundos): 5 pasos de train + prediccion de 8 imagenes.
+    Si algo esta roto, aborta ANTES de gastar horas de GPU."""
+    OUT.mkdir(exist_ok=True)
+    sh([sys.executable, "src/aquatic.py", "train", "--epochs", 1, "--max-steps", 5, "--bs", 8, "--unfreeze", a.unfreeze,
+        "--ckpt", "outputs/smoke.pt", "--workers", 2])
+    sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", "outputs/smoke.pt", "--limit", 8,
+        "--out", "outputs/smoke_submission.csv", "--unfreeze", a.unfreeze])
+    for f in OUT.glob("smoke.pt*"): f.unlink()
+    print("preflight OK: el pipeline funciona de punta a punta")
 
 
 def ckpt_name(seed): return f"best_s{seed}.pt"
@@ -141,6 +153,7 @@ if __name__ == "__main__":
     ap.add_argument("--hours", type=float, help="tope total de entrenamiento (horas); reparte entre semillas")
     ap.add_argument("--bs", type=int, default=64); ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed0", type=int, default=0); ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")
     ap.add_argument("--message", default="auto")
@@ -155,6 +168,7 @@ if __name__ == "__main__":
         import torch
         if not torch.cuda.is_available(): sys.exit("No hay GPU: Runtime > Change runtime type > GPU")
     st = a.stages.split(",") + (["submit"] if a.submit else [])
+    if "train" in st and not a.no_preflight: st.append("preflight")
     for s in st:
         assert s in STAGES, f"etapa desconocida {s}"
     for s in [x for x in STAGES if x in st]:
