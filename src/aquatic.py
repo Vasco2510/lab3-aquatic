@@ -27,7 +27,7 @@ def list_images(folder):
 
 
 def load_img(path):
-    return torch.from_numpy(np.asarray(Image.open(path).convert("RGB"))).permute(2, 0, 1)  # uint8 CHW
+    return torch.from_numpy(np.array(Image.open(path).convert("RGB"))).permute(2, 0, 1)  # uint8 CHW
 
 
 def patch_mask_to_pixels(m):  # m: (B,64) bool -> (B,1,256,256)
@@ -73,7 +73,7 @@ class Net(nn.Module):
         self.nreg = int(getattr(self.bb.config, "num_register_tokens", 0) or 0)
         self.norm = nn.LayerNorm(d)
         self.ctx = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d, 8, d * 2, batch_first=True, norm_first=True), 2)
+            nn.TransformerEncoderLayer(d, 8, d * 2, batch_first=True, norm_first=True), 2, enable_nested_tensor=False)
         self.pos = nn.Parameter(torch.zeros(1, 64, d))
         self.proj = nn.Linear(d, d); nn.init.zeros_(self.proj.weight); nn.init.zeros_(self.proj.bias)
         self.cb = nn.Parameter(F.normalize(torch.as_tensor(codebook).float(), dim=1))

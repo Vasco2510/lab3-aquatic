@@ -111,11 +111,13 @@ def stage_data(a):
     import gdown
     DATA.mkdir(exist_ok=True)
     cache = pathlib.Path(a.persist) / "data" if a.persist else None
+    roots = [pathlib.Path(a.persist), cache] if a.persist else []  # raiz de persist (copia manual) y persist/data
     for name, fid in DRIVE_IDS.items():
         dst = DATA / name
         if not dst.exists():
-            if cache and (cache / name).exists():
-                print(f"{name}: copiando desde tu Drive (cache)"); shutil.copy(cache / name, dst)
+            hit = next((r / name for r in roots if (r / name).exists()), None)
+            if hit:
+                print(f"{name}: copiando desde tu Drive ({hit})"); shutil.copy(hit, dst)
             else:
                 gdown.download(id=fid, output=str(dst), quiet=False)
                 if cache:
