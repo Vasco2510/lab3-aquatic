@@ -70,20 +70,42 @@ def stage_labels(a):
     sh([sys.executable, "src/aquatic.py", "labels", "--train-dir", "data/train"])
 
 
+PRESETS = {  # --preset; cualquier flag explicito lo sobreescribe
+    "smoke": dict(epochs=1, seeds=1, unfreeze=2),            # ~minutos: comprueba que todo corre
+    "full":  dict(epochs=15, seeds=1, unfreeze=4),
+    "night": dict(epochs=20, seeds=3, unfreeze=6, hours=8),  # ensamble de 3 semillas, con tope de tiempo
+}
+
+
+def ckpt_name(seed): return f"best_s{seed}.pt"
+
+
 def stage_train(a):
     OUT.mkdir(exist_ok=True)
-    if a.persist and (pathlib.Path(a.persist) / "best.pt").exists() and not (OUT / "best.pt").exists():
-        shutil.copy(pathlib.Path(a.persist) / "best.pt", OUT / "best.pt")  # reanudar desde Drive
-    cmd = [sys.executable, "src/aquatic.py", "train", "--epochs", a.epochs, "--bs", a.bs,
-           "--unfreeze", a.unfreeze, "--lr", a.lr]
-    if a.resume: cmd.append("--resume")
-    sh(cmd)
-    persist(a, "best.pt")
+    pdir = pathlib.Path(a.persist) if a.persist else None
+    per_seed = ((a.hours * 60 - 15) / a.seeds) if a.hours else 0  # 15 min de reserva para predecir/enviar
+    for seed in range(a.seed0, a.seed0 + a.seeds):
+        name = ckpt_name(seed)
+        if pdir and (pdir / f"done_s{seed}").exists() and not a.force:
+            print(f"seed {seed} ya completada en {pdir}; se omite")
+            shutil.copy(pdir / name, OUT / name); continue
+        if pdir and (pdir / name).exists() and not (OUT / name).exists():
+            shutil.copy(pdir / name, OUT / name)  # reanudar tras desconexion
+        cmd = [sys.executable, "src/aquatic.py", "train", "--epochs", a.epochs, "--bs", a.bs, "--unfreeze", a.unfreeze,
+               "--lr", a.lr, "--seed", seed, "--ckpt", f"outputs/{name}", "--workers", a.workers]
+        if per_seed: cmd += ["--time-budget", int(per_seed)]
+        if a.persist: cmd += ["--persist", a.persist]
+        if a.resume or (OUT / name).exists(): cmd.append("--resume")
+        sh(cmd)
+        if pdir:
+            pdir.mkdir(parents=True, exist_ok=True); shutil.copy(OUT / name, pdir / name); (pdir / f"done_s{seed}").touch()
 
 
 def stage_predict(a):
     OUT.mkdir(exist_ok=True)
-    sh([sys.executable, "src/aquatic.py", "predict"])
+    ck = sorted(str(p.relative_to(ROOT)) for p in OUT.glob("best_s*.pt"))
+    if not ck: sys.exit("No hay checkpoints en outputs/ (entrena primero)")
+    sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", ",".join(ck)])
     persist(a, "submission.csv")
 
 
@@ -114,13 +136,22 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--stages", default="data,labels,train,predict,check")
     ap.add_argument("--submit", action="store_true", help="añade la etapa de envío a Kaggle")
-    ap.add_argument("--epochs", type=int, default=15); ap.add_argument("--bs", type=int, default=64)
-    ap.add_argument("--unfreeze", type=int, default=4); ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--preset", choices=list(PRESETS), default="full")
+    ap.add_argument("--epochs", type=int); ap.add_argument("--unfreeze", type=int); ap.add_argument("--seeds", type=int)
+    ap.add_argument("--hours", type=float, help="tope total de entrenamiento (horas); reparte entre semillas")
+    ap.add_argument("--bs", type=int, default=64); ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed0", type=int, default=0); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")
     ap.add_argument("--message", default="auto")
     a = ap.parse_args()
+    for k, v in PRESETS[a.preset].items():
+        if getattr(a, k, None) is None: setattr(a, k, v)
     load_secrets()
+    if {"labels", "train", "predict"} & set(a.stages.split(",")):
+        if not os.environ.get("HF_TOKEN"): sys.exit("Falta HF_TOKEN (Colab Secrets, variable de entorno o .env)")
+        import torch
+        if not torch.cuda.is_available(): sys.exit("No hay GPU: Runtime > Change runtime type > GPU")
     st = a.stages.split(",") + (["submit"] if a.submit else [])
     for s in st:
         assert s in STAGES, f"etapa desconocida {s}"

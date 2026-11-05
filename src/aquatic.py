@@ -114,61 +114,78 @@ class DS(torch.utils.data.Dataset):
         return x, torch.from_numpy(self.lab[self.ids[i]])
 
 
+def amp_dtype():
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16  # T4 -> fp16
+
+
 def cmd_train(a):
-    dev = "cuda"
+    import shutil, time
+    dev = "cuda"; t0 = time.time(); dt = amp_dtype()
+    random.seed(a.seed); torch.manual_seed(a.seed)
     imgs = list_images(a.train_dir); ids = sorted(imgs)
     lab = load_labels(a.labels, ids); ids = [i for i in ids if (lab[i] >= 0).all()]
-    random.seed(0); random.shuffle(ids)
+    random.Random(0).shuffle(ids)  # split fijo entre semillas
     nv = max(200, len(ids) // 20); va, tr = ids[:nv], ids[nv:]
-    print(f"train {len(tr)} val {len(va)}")
-    cb = np.load(a.codebook)
-    net = Net(cb, a.unfreeze).to(dev)
+    print(f"train {len(tr)} val {len(va)} amp {dt}")
+    net = Net(np.load(a.codebook), a.unfreeze).to(dev)
     if a.resume and os.path.exists(a.ckpt):
         net.load_state_dict(torch.load(a.ckpt, map_location=dev)); print("reanudando desde", a.ckpt)
     bbp = [p for p in net.bb.parameters() if p.requires_grad]
     hp = [p for n, p in net.named_parameters() if not n.startswith("bb.")]
     opt = torch.optim.AdamW([{"params": bbp, "lr": a.lr * 0.1}, {"params": hp, "lr": a.lr}], weight_decay=0.05)
-    dl = torch.utils.data.DataLoader(DS(tr, imgs, lab, True), a.bs, shuffle=True, num_workers=2, drop_last=True)
-    dv = torch.utils.data.DataLoader(DS(va, imgs, lab, False), a.bs, num_workers=2)
-    total = a.epochs * len(dl); sched = torch.optim.lr_scheduler.OneCycleLR(
-        opt, [a.lr * 0.1, a.lr], total_steps=total, pct_start=0.05)
-    best = 0
+    dl = torch.utils.data.DataLoader(DS(tr, imgs, lab, True), a.bs, shuffle=True, num_workers=a.workers,
+                                     drop_last=True, persistent_workers=True)
+    dv = torch.utils.data.DataLoader(DS(va, imgs, lab, False), a.bs, num_workers=a.workers)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, [a.lr * 0.1, a.lr], total_steps=a.epochs * len(dl), pct_start=0.05)
+    scaler = torch.amp.GradScaler(enabled=(dt == torch.float16))
+    best, ep_t = 0, 0
     for ep in range(a.epochs):
-        net.train()
+        te = time.time(); net.train()
         for x, y in dl:
-            x, y = x.to(dev), y.to(dev); m = random_mask(len(x), device=dev)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            x, y = x.to(dev, non_blocking=True), y.to(dev, non_blocking=True); m = random_mask(len(x), device=dev)
+            with torch.autocast("cuda", dtype=dt):
                 lg = net(prep(x, m))
             loss = F.cross_entropy(lg[m].float(), y[m], label_smoothing=0.05)
-            opt.zero_grad(set_to_none=True); loss.backward()
-            nn.utils.clip_grad_norm_(net.parameters(), 1.0); opt.step(); sched.step()
+            opt.zero_grad(set_to_none=True); scaler.scale(loss).backward()
+            scaler.unscale_(opt); nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            scaler.step(opt); scaler.update(); sched.step()
         net.eval(); c = n = 0
-        g = torch.Generator().manual_seed(1); random.seed(1)
         with torch.no_grad():
             for x, y in dv:
                 x, y = x.to(dev), y.to(dev); m = random_mask(len(x), device=dev)
-                with torch.autocast("cuda", dtype=torch.bfloat16):
+                with torch.autocast("cuda", dtype=dt):
                     lg = net(prep(x, m))
                 c += (lg.argmax(-1)[m] == y[m]).sum().item(); n += m.sum().item()
-        acc = c / n; print(f"ep {ep} loss {loss.item():.3f} val_acc {acc:.4f}", flush=True)
+        acc = c / n; ep_t = time.time() - te
+        print(f"[seed {a.seed}] ep {ep+1}/{a.epochs} loss {loss.item():.3f} val_acc {acc:.4f} ({ep_t/60:.1f} min)", flush=True)
         if acc > best:
-            best = acc; torch.save({k: v for k, v in net.state_dict().items()}, a.ckpt)
-    print("best", best)
+            best = acc; torch.save(net.state_dict(), a.ckpt)
+            if a.persist:
+                os.makedirs(a.persist, exist_ok=True); shutil.copy(a.ckpt, a.persist)
+        if a.time_budget and (time.time() - t0 + ep_t) > a.time_budget * 60:
+            print("presupuesto de tiempo agotado: se detiene el entrenamiento"); break
+    print(f"best val_acc {best:.4f}")
+    with open(a.ckpt + ".val", "w") as f: f.write(str(best))
 
 
 def cmd_predict(a):
-    dev = "cuda"; net = Net(np.load(a.codebook), a.unfreeze).to(dev)
-    net.load_state_dict(torch.load(a.ckpt, map_location=dev)); net.eval()
+    dev = "cuda"; dt = amp_dtype(); cb = np.load(a.codebook)
+    paths = [p for p in a.ckpts.split(",") if p] if a.ckpts else [a.ckpt]
+    nets = []
+    for p in paths:
+        net = Net(cb, a.unfreeze).to(dev); net.load_state_dict(torch.load(p, map_location=dev)); nets.append(net.eval())
+    print("ensamble de", len(nets), "modelos:", paths)
     tg = pd.read_csv(a.target_csv); imgs = list_images(a.test_dir); rows = []
     with torch.no_grad():
         for i, t in zip(tg["ID"].astype(str), tg["target"].astype(str)):
             ps = [int(p) for p in t.split()]
             x = load_img(imgs[i])[None].to(dev)
             m = torch.zeros(1, 64, dtype=torch.bool, device=dev); m[0, ps] = True
-            # el test ya trae negro; usamos la imagen tal cual (prep re-aplica negro igual)
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                lg = net(prep(x, m))
-            pred = lg[0].argmax(-1).cpu().numpy()
+            pr = 0
+            for net in nets:
+                with torch.autocast("cuda", dtype=dt):
+                    pr = pr + net(prep(x, m)).float().softmax(-1)
+            pred = pr[0].argmax(-1).cpu().numpy()
             rows += [(f"{i}_{p}", int(pred[p])) for p in ps]
     pd.DataFrame(rows, columns=["Id", "Target"]).to_csv(a.out, index=False)
     print("escrito", a.out, len(rows))
@@ -181,8 +198,12 @@ if __name__ == "__main__":
         p.add_argument("--train-dir", default="data/train"); p.add_argument("--codebook", default="data/codebook.npy")
         p.add_argument("--dino-vq", default="data/dino_vq.py"); p.add_argument("--out-target", default="data/target_all64.csv")
         p.add_argument("--out-labels", default="data/labels_train.csv"); p.add_argument("--labels", default="data/labels_train.csv")
-        p.add_argument("--ckpt", default="outputs/best.pt"); p.add_argument("--epochs", type=int, default=15)
-        p.add_argument("--bs", type=int, default=64); p.add_argument("--lr", type=float, default=1e-3)
-        p.add_argument("--unfreeze", type=int, default=4); p.add_argument("--test-dir", default="data/test")
-        p.add_argument("--resume", action="store_true"); p.add_argument("--target-csv", default="data/target.csv"); p.add_argument("--out", default="outputs/submission.csv")
+        p.add_argument("--ckpt", default="outputs/best.pt"); p.add_argument("--ckpts", default="")
+        p.add_argument("--epochs", type=int, default=15); p.add_argument("--bs", type=int, default=64)
+        p.add_argument("--lr", type=float, default=1e-3); p.add_argument("--unfreeze", type=int, default=4)
+        p.add_argument("--seed", type=int, default=0); p.add_argument("--workers", type=int, default=4)
+        p.add_argument("--time-budget", type=float, default=0, help="minutos; 0 = sin limite")
+        p.add_argument("--persist", default=""); p.add_argument("--test-dir", default="data/test")
+        p.add_argument("--resume", action="store_true"); p.add_argument("--target-csv", default="data/target.csv")
+        p.add_argument("--out", default="outputs/submission.csv")
     a = ap.parse_args(); {"labels": cmd_labels, "train": cmd_train, "predict": cmd_predict}[a.cmd](a)
