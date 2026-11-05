@@ -148,6 +148,8 @@ if __name__ == "__main__":
     for k, v in PRESETS[a.preset].items():
         if getattr(a, k, None) is None: setattr(a, k, v)
     load_secrets()
+    try: print('codigo en ejecucion, commit:', subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT, text=True).strip())
+    except Exception: pass
     if {"labels", "train", "predict"} & set(a.stages.split(",")):
         if not os.environ.get("HF_TOKEN"): sys.exit("Falta HF_TOKEN (Colab Secrets, variable de entorno o .env)")
         import torch
