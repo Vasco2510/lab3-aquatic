@@ -23,13 +23,13 @@ DRIVE_IDS = {  # carpeta pública del curso
 STAGES = ["data", "labels", "preflight", "train", "predict", "check", "submit"]
 
 
-def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY")):
+def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"), extra=None):
     env_file = {}
-    f = ROOT / ".env"
-    if f.exists():
-        for line in f.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.lstrip().startswith("#"):
-                k, v = line.split("=", 1); env_file[k.strip()] = v.strip().strip('"').strip("'")
+    for f in (ROOT / ".env", extra):  # .env del repo y .env guardado en Drive (--persist)
+        if f and pathlib.Path(f).exists():
+            for line in pathlib.Path(f).read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.split("=", 1); env_file.setdefault(k.strip(), v.strip().strip('"').strip("'"))
     try:
         from google.colab import userdata
     except Exception:
@@ -160,7 +160,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     for k, v in PRESETS[a.preset].items():
         if getattr(a, k, None) is None: setattr(a, k, v)
-    load_secrets()
+    load_secrets(extra=(pathlib.Path(a.persist) / ".env") if a.persist else None)
     try: print('codigo en ejecucion, commit:', subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT, text=True).strip())
     except Exception: pass
     if {"labels", "train", "predict"} & set(a.stages.split(",")):
