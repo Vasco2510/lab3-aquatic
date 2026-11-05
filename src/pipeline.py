@@ -20,7 +20,7 @@ DRIVE_IDS = {  # carpeta pública del curso
     "codebook.npy": "1Hhjxp23rHuciFSItJiLBP2wfA_AK2Nyw",
     "dino_vq.py": "1SjiA9eAcG8LrW-I6KOtiraJjbjwag8h0",
 }
-STAGES = ["data", "labels", "preflight", "train", "predict", "check", "submit"]
+STAGES = ["doctor", "data", "labels", "preflight", "train", "predict", "check", "submit"]
 
 
 def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"), extra=None):
@@ -50,6 +50,47 @@ def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"), extra=None
 def sh(cmd):
     print("$", " ".join(map(str, cmd)), flush=True)
     subprocess.check_call(list(map(str, cmd)), cwd=ROOT)
+
+
+def stage_doctor(a):
+    """Verifica en segundos todo lo que puede fallar por configuracion, antes de gastar GPU."""
+    bad = []
+    def chk(name, cond, hint=""):
+        print(("  OK    " if cond else "  FALLA ") + name + ("" if cond else f"  -> {hint}"))
+        if not cond: bad.append(name)
+    needs_gpu = bool({"labels", "preflight", "train", "predict"} & set(a.stages.split(",")))
+    if needs_gpu:
+        import torch
+        chk("GPU disponible", torch.cuda.is_available(), "Runtime con GPU (cuenta Colab Pro)")
+    tok = os.environ.get("HF_TOKEN")
+    chk("HF_TOKEN presente", bool(tok), "Secrets, PERSIST/.env o prompt")
+    if tok:
+        try:
+            from huggingface_hub import hf_hub_download
+            hf_hub_download("facebook/dinov3-vitb16-pretrain-lvd1689m", "config.json", token=tok); ok = True
+        except Exception as e:
+            ok = False; print("     detalle:", type(e).__name__)
+        chk("acceso al modelo DINOv3", ok, "acepta la licencia en huggingface.co/facebook/dinov3-vitb16-pretrain-lvd1689m")
+    if a.persist:
+        d = pathlib.Path(a.persist)
+        chk(f"carpeta persist existe ({a.persist})", d.is_dir(), "Drive no montado o ruta mal escrita")
+        if d.is_dir():
+            try: (d / ".w").write_text("x"); (d / ".w").unlink(); w = True
+            except Exception: w = False
+            chk("persist escribible", w, "permisos de Drive")
+            print("  info  .env en persist:", (d / ".env").exists())
+    if a.submit:
+        chk("KAGGLE_USERNAME/KEY", bool(os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")), "faltan en .env")
+        if os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"):
+            r = subprocess.run([sys.executable, "-m", "kaggle", "competitions", "submissions", "-c", COMPETITION],
+                               capture_output=True, text=True, cwd=ROOT)
+            chk(f"Kaggle: credenciales validas y unido a '{COMPETITION}'", r.returncode == 0,
+                (r.stderr or r.stdout).strip()[:200])
+    if "data" not in a.stages.split(","):
+        for f in ("target.csv", "codebook.npy", "dino_vq.py"):
+            chk(f"data/{f}", (DATA / f).exists(), "ejecuta la etapa data")
+    if bad: sys.exit("DOCTOR: %d problema(s). Corrige y vuelve a ejecutar." % len(bad))
+    print("DOCTOR: todo en orden")
 
 
 def stage_data(a):
@@ -163,12 +204,9 @@ if __name__ == "__main__":
     load_secrets(extra=(pathlib.Path(a.persist) / ".env") if a.persist else None)
     try: print('codigo en ejecucion, commit:', subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT, text=True).strip())
     except Exception: pass
-    if {"labels", "train", "predict"} & set(a.stages.split(",")):
-        if not os.environ.get("HF_TOKEN"): sys.exit("Falta HF_TOKEN (Colab Secrets, variable de entorno o .env)")
-        import torch
-        if not torch.cuda.is_available(): sys.exit("No hay GPU: Runtime > Change runtime type > GPU")
     st = a.stages.split(",") + (["submit"] if a.submit else [])
     if "train" in st and not a.no_preflight: st.append("preflight")
+    if "doctor" not in st: st.append("doctor")
     for s in st:
         assert s in STAGES, f"etapa desconocida {s}"
     for s in [x for x in STAGES if x in st]:
