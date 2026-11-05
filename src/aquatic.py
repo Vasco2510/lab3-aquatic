@@ -43,6 +43,18 @@ def random_mask(B, lo=8, hi=20, device="cpu"):
     return m
 
 
+def get_layers(bb):
+    """Lista de bloques del ViT segun version de transformers (4.x: bb.layer; 5.x: bb.model.layer)."""
+    for path in ("model.layer", "layer", "encoder.layer"):
+        o = bb
+        try:
+            for part in path.split("."): o = getattr(o, part)
+            return o
+        except AttributeError:
+            continue
+    raise AttributeError("no encuentro los bloques de DINOv3 en " + type(bb).__name__)
+
+
 class Net(nn.Module):
     """Réplica de dino_vq.py (capa 10, pool 2x2, L2, coseno vs codebook) pero sobre la
     imagen ENMASCARADA; las últimas `unfreeze` capas (<=10) se afinan y una cabeza
@@ -53,12 +65,9 @@ class Net(nn.Module):
         super().__init__()
         from transformers import AutoModel
         self.bb = AutoModel.from_pretrained(MODEL_ID)
-        layers = self.bb.layer if hasattr(self.bb, "layer") else self.bb.encoder.layer
-        keep = nn.ModuleList(list(layers)[: self.LAYER])  # descarta capas 11-12 (no se usan)
-        if hasattr(self.bb, "layer"): self.bb.layer = keep
-        else: self.bb.encoder.layer = keep
+        layers = get_layers(self.bb)  # no se trunca: hidden_states[10] se indexa igual que en dino_vq.py
         for p in self.bb.parameters(): p.requires_grad = False
-        for blk in keep[-unfreeze:]:
+        for blk in list(layers)[self.LAYER - unfreeze: self.LAYER]:  # bloques 10-unfreeze .. 10
             for p in blk.parameters(): p.requires_grad = True
         d = self.bb.config.hidden_size
         self.nreg = int(getattr(self.bb.config, "num_register_tokens", 0) or 0)
@@ -71,7 +80,7 @@ class Net(nn.Module):
         self.scale = nn.Parameter(torch.tensor(30.0))
 
     def forward(self, x):  # x normalizado (B,3,256,256)
-        h = self.bb(pixel_values=x, output_hidden_states=True).hidden_states[-1]  # = hidden_states[10]
+        h = self.bb(pixel_values=x, output_hidden_states=True).hidden_states[self.LAYER]  # igual que LAYER_INDEX de dino_vq.py
         h = h[:, -256:]  # tokens espaciales (descarta CLS + registers)
         B, _, D = h.shape
         h = h.reshape(B, 8, 2, 8, 2, D).mean((2, 4)).reshape(B, 64, D).float()
