@@ -127,6 +127,15 @@ def amp_dtype():
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16  # T4 -> fp16
 
 
+def atomic_save(obj, path, persist=""):
+    """Guarda local y copia a Drive con rename atomico (una desconexion no deja archivos a medias)."""
+    import shutil
+    torch.save(obj, path + ".tmp"); os.replace(path + ".tmp", path)
+    if persist:
+        os.makedirs(persist, exist_ok=True); dst = os.path.join(persist, os.path.basename(path))
+        shutil.copy(path, dst + ".tmp"); os.replace(dst + ".tmp", dst)
+
+
 def cmd_train(a):
     import shutil, time
     dev = "cuda"; t0 = time.time(); dt = amp_dtype()
@@ -137,8 +146,6 @@ def cmd_train(a):
     nv = max(200, len(ids) // 20); va, tr = ids[:nv], ids[nv:]
     print(f"train {len(tr)} val {len(va)} amp {dt}")
     net = Net(np.load(a.codebook), a.unfreeze).to(dev)
-    if a.resume and os.path.exists(a.ckpt):
-        net.load_state_dict(torch.load(a.ckpt, map_location=dev)); print("reanudando desde", a.ckpt)
     bbp = [p for p in net.bb.parameters() if p.requires_grad]
     hp = [p for n, p in net.named_parameters() if not n.startswith("bb.")]
     opt = torch.optim.AdamW([{"params": bbp, "lr": a.lr * 0.1}, {"params": hp, "lr": a.lr}], weight_decay=0.05)
@@ -147,8 +154,24 @@ def cmd_train(a):
     dv = torch.utils.data.DataLoader(DS(va, imgs, lab, False), a.bs, num_workers=a.workers)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, [a.lr * 0.1, a.lr], total_steps=a.epochs * len(dl), pct_start=0.05)
     scaler = torch.amp.GradScaler(enabled=(dt == torch.float16))
-    best, ep_t = 0, 0
-    for ep in range(a.epochs):
+    state_path = a.ckpt.replace(".pt", "_state.pt")
+    cfg = dict(epochs=a.epochs, unfreeze=a.unfreeze, bs=a.bs, lr=a.lr, seed=a.seed)
+    best, ep_t, start = 0.0, 0, 0
+    if os.path.exists(state_path) and not a.fresh:
+        try:
+            st = torch.load(state_path, map_location=dev, weights_only=False)  # archivo propio y de confianza
+            if st["cfg"] == cfg:
+                net.load_state_dict(st["net"]); opt.load_state_dict(st["opt"]); sched.load_state_dict(st["sched"])
+                scaler.load_state_dict(st["scaler"]); start, best = st["epoch"] + 1, st["best"]
+                print(f"[seed {a.seed}] reanudando en la epoca {start + 1}/{a.epochs} (mejor val_acc {best:.4f})", flush=True)
+            else:
+                print("estado previo con otra configuracion: se ignora y se entrena desde cero")
+        except Exception as e:
+            print("!! no se pudo leer el estado previo, se entrena desde cero:", type(e).__name__, e)
+    elif a.resume and os.path.exists(a.ckpt) and not a.fresh:  # solo hay pesos: arranca de ellos
+        net.load_state_dict(torch.load(a.ckpt, map_location=dev)); print("reanudando pesos desde", a.ckpt)
+    finished = start >= a.epochs
+    for ep in range(start, a.epochs):
         te = time.time(); net.train()
         for bi, (x, y) in enumerate(dl):
             if a.max_steps and bi >= a.max_steps: break
@@ -173,10 +196,20 @@ def cmd_train(a):
             best = acc; torch.save(net.state_dict(), a.ckpt)
             if a.persist:
                 os.makedirs(a.persist, exist_ok=True); shutil.copy(a.ckpt, a.persist)
-        if a.time_budget and (time.time() - t0 + ep_t) > a.time_budget * 60:
-            print("presupuesto de tiempo agotado: se detiene el entrenamiento"); break
-    print(f"best val_acc {best:.4f}")
+        if not a.max_steps:  # estado completo (modelo+optimizador+scheduler+epoca) para reanudar exacto
+            st = dict(net=net.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(), scaler=scaler.state_dict(),
+                      epoch=ep, best=best, cfg=cfg)
+            try: atomic_save(st, state_path, a.persist if (ep + 1) % 2 == 0 else "")  # Drive cada 2 epocas
+            except Exception as e: print("aviso: no se pudo guardar el estado:", type(e).__name__, e)
+        finished = ep == a.epochs - 1
+        if not finished and a.time_budget and (time.time() - t0 + ep_t) > a.time_budget * 60:
+            print("presupuesto de tiempo agotado: se detiene (se puede reanudar exacto en la proxima corrida)"); break
+    print(f"best val_acc {best:.4f}" + ("  [COMPLETO]" if finished else "  [INCOMPLETO]"))
     with open(a.ckpt + ".val", "w") as f: f.write(str(best))
+    if finished and not a.max_steps:
+        open(a.ckpt + ".finished", "w").close()
+        for f in (state_path, os.path.join(a.persist, os.path.basename(state_path)) if a.persist else None):
+            if f and os.path.exists(f): os.remove(f)  # ya no hace falta
 
 
 def cmd_predict(a):
@@ -218,6 +251,6 @@ if __name__ == "__main__":
         p.add_argument("--time-budget", type=float, default=0, help="minutos; 0 = sin limite")
         p.add_argument("--max-steps", type=int, default=0, help="solo prueba: pasos por epoca"); p.add_argument("--limit", type=int, default=0)
         p.add_argument("--persist", default=""); p.add_argument("--test-dir", default="data/test")
-        p.add_argument("--resume", action="store_true"); p.add_argument("--target-csv", default="data/target.csv")
+        p.add_argument("--resume", action="store_true"); p.add_argument("--fresh", action="store_true"); p.add_argument("--target-csv", default="data/target.csv")
         p.add_argument("--out", default="outputs/submission.csv")
     a = ap.parse_args(); {"labels": cmd_labels, "train": cmd_train, "predict": cmd_predict}[a.cmd](a)

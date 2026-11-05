@@ -161,20 +161,24 @@ def stage_train(a):
     pdir = pathlib.Path(a.persist) if a.persist else None
     per_seed = ((a.hours * 60 - 15) / a.seeds) if a.hours else 0  # 15 min de reserva para predecir/enviar
     for seed in range(a.seed0, a.seed0 + a.seeds):
-        name = ckpt_name(seed)
+        name = ckpt_name(seed); state = name.replace(".pt", "_state.pt")
         if pdir and (pdir / f"done_s{seed}").exists() and not a.force:
             print(f"seed {seed} ya completada en {pdir}; se omite")
             shutil.copy(pdir / name, OUT / name); continue
-        if pdir and (pdir / name).exists() and not (OUT / name).exists():
-            shutil.copy(pdir / name, OUT / name)  # reanudar tras desconexion
+        if pdir and not a.force:  # reanudar tras desconexion: ultimo estado completo + mejor checkpoint
+            for f in (name, state):
+                if (pdir / f).exists() and not (OUT / f).exists(): shutil.copy(pdir / f, OUT / f)
         cmd = [sys.executable, "src/aquatic.py", "train", "--epochs", a.epochs, "--bs", a.bs, "--unfreeze", a.unfreeze,
                "--lr", a.lr, "--seed", seed, "--ckpt", f"outputs/{name}", "--workers", a.workers]
         if per_seed: cmd += ["--time-budget", int(per_seed)]
         if a.persist: cmd += ["--persist", a.persist]
-        if a.resume or (OUT / name).exists(): cmd.append("--resume")
+        if a.force: cmd.append("--fresh")
+        elif a.resume or (OUT / name).exists(): cmd.append("--resume")
         sh(cmd)
         if pdir:
-            pdir.mkdir(parents=True, exist_ok=True); shutil.copy(OUT / name, pdir / name); (pdir / f"done_s{seed}").touch()
+            pdir.mkdir(parents=True, exist_ok=True); shutil.copy(OUT / name, pdir / name)
+            if (OUT / (name + ".finished")).exists(): (pdir / f"done_s{seed}").touch()
+            else: print(f"seed {seed} INCOMPLETA (tope de tiempo): la proxima corrida la continua desde su ultima epoca")
 
 
 def stage_predict(a):
