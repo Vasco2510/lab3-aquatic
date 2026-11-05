@@ -1,0 +1,7 @@
+data/
+outputs/
+.env
+__pycache__/
+*.pt
+*.zip
+*.pdf

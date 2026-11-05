@@ -1,0 +1,9 @@
+torch
+transformers>=4.56
+huggingface_hub
+gdown
+pandas
+numpy
+pillow
+tqdm
+kaggle
