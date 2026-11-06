@@ -204,8 +204,20 @@ def stage_predict(a):
     if not ck: sys.exit("No hay checkpoints en outputs/ (entrena primero)")
     sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", ",".join(ck)])
     persist(a, "submission.csv")
-    if a.persist:  # copia con nombre propio para no perder envios anteriores
-        shutil.copy(OUT / "submission.csv", pathlib.Path(a.persist) / f"submission_{'all' if a.all_models else a.mode}.csv")
+    # registro: cada envio guarda una copia con nombre propio (nunca se sobreescribe)
+    import datetime, re
+    seeds = "-".join(re.search(r"s(\d+)", pathlib.Path(c).stem).group(1) for c in ck)
+    kinds = "v1v2" if a.all_models else a.mode
+    a.sub_tag = f"{datetime.datetime.now():%Y%m%d-%H%M}_{kinds}_n{len(ck)}_s{seeds}" + ("_full" if a.full else "")
+    sdir = OUT / "submissions"; sdir.mkdir(exist_ok=True)
+    shutil.copy(OUT / "submission.csv", sdir / f"{a.sub_tag}.csv")
+    line = f"{a.sub_tag},{kinds},{len(ck)},{';'.join(pathlib.Path(c).name for c in ck)},{'full' if a.full else ''}\n"
+    with open(sdir / "registro.csv", "a", encoding="utf-8") as f: f.write(line)
+    if a.persist:
+        pd_ = pathlib.Path(a.persist) / "submissions"; pd_.mkdir(parents=True, exist_ok=True)
+        shutil.copy(sdir / f"{a.sub_tag}.csv", pd_ / f"{a.sub_tag}.csv")
+        with open(pd_ / "registro.csv", "a", encoding="utf-8") as f: f.write(line)
+    print(f"registro: submissions/{a.sub_tag}.csv")
 
 
 def stage_check(a):
@@ -222,7 +234,7 @@ def stage_submit(a):
     if not (os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")):
         sys.exit("Faltan KAGGLE_USERNAME / KAGGLE_KEY")
     sh(kaggle_cmd() + ["competitions", "submit", "-c", COMPETITION,
-        "-f", "outputs/submission.csv", "-m", (f"{a.preset} {a.mode}" if a.message == "auto" else a.message)])
+        "-f", "outputs/submission.csv", "-m", (getattr(a, "sub_tag", None) or f"{a.preset} {a.mode}") if a.message == "auto" else a.message])
 
 
 def persist(a, name):
