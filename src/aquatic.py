@@ -79,14 +79,16 @@ class Net(nn.Module):
         self.cb = nn.Parameter(F.normalize(torch.as_tensor(codebook).float(), dim=1))
         self.scale = nn.Parameter(torch.tensor(30.0))
 
-    def forward(self, x):  # x normalizado (B,3,256,256)
+    def forward(self, x, return_emb=False):  # x normalizado (B,3,256,256)
         h = self.bb(pixel_values=x, output_hidden_states=True).hidden_states[self.LAYER]  # igual que LAYER_INDEX de dino_vq.py
         h = h[:, -256:]  # tokens espaciales (descarta CLS + registers)
         B, _, D = h.shape
         h = h.reshape(B, 8, 2, 8, 2, D).mean((2, 4)).reshape(B, 64, D).float()
         h = F.normalize(h, dim=-1)
         z = h + self.proj(self.ctx(self.norm(h) + self.pos))
-        return self.scale * F.normalize(z, dim=-1) @ F.normalize(self.cb, dim=-1).T  # (B,64,1024)
+        zn = F.normalize(z, dim=-1)
+        lg = self.scale * zn @ F.normalize(self.cb, dim=-1).T  # (B,64,1024)
+        return (lg, zn) if return_emb else lg
 
 
 def prep(u8, mask):  # u8: (B,3,H,W) uint8 ; mask (B,64) bool

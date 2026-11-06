@@ -129,6 +129,7 @@ def stage_data(a):
 
 
 def stage_labels(a):
+    if a.mode == "v2": print("v2 calcula las etiquetas en linea: se omite"); return
     if (DATA / "labels_train.csv").exists() and not a.force:
         print("labels ya existen, se omite"); return
     sh([sys.executable, "src/aquatic.py", "labels", "--train-dir", "data/train"])
@@ -138,6 +139,9 @@ PRESETS = {  # --preset; cualquier flag explicito lo sobreescribe
     "smoke": dict(epochs=1, seeds=1, unfreeze=2),            # ~minutos: comprueba que todo corre
     "full":  dict(epochs=15, seeds=1, unfreeze=4),
     "night": dict(epochs=20, seeds=3, unfreeze=6, hours=8),  # ensamble de 3 semillas, con tope de tiempo
+    # v2: maestro en linea + aumentos + validacion por clusters (src/v2.py)
+    "v2smoke": dict(mode="v2", epochs=1, seeds=1, unfreeze=10),
+    "v2":      dict(mode="v2", epochs=30, seeds=2, unfreeze=10, hours=6),
 }
 
 
@@ -145,15 +149,20 @@ def stage_preflight(a):
     """Prueba de humo automatica (segundos): 5 pasos de train + prediccion de 8 imagenes.
     Si algo esta roto, aborta ANTES de gastar horas de GPU."""
     OUT.mkdir(exist_ok=True)
-    sh([sys.executable, "src/aquatic.py", "train", "--epochs", 1, "--max-steps", 5, "--bs", 8, "--unfreeze", a.unfreeze,
-        "--ckpt", "outputs/smoke.pt", "--workers", 2])
+    if a.mode == "v2":
+        sh([sys.executable, "src/v2.py", "train", "--epochs", 1, "--max-steps", 3, "--bs", 8, "--unfreeze", a.unfreeze,
+            "--ckpt", "outputs/smoke.pt", "--workers", 2, "--limit-imgs", 200, "--k", 10, "--holdout", 0.2])
+        (OUT / "split_v2.json").unlink(missing_ok=True)
+    else:
+        sh([sys.executable, "src/aquatic.py", "train", "--epochs", 1, "--max-steps", 5, "--bs", 8, "--unfreeze", a.unfreeze,
+            "--ckpt", "outputs/smoke.pt", "--workers", 2])
     sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", "outputs/smoke.pt", "--limit", 8,
         "--out", "outputs/smoke_submission.csv", "--unfreeze", a.unfreeze])
     for f in OUT.glob("smoke.pt*"): f.unlink()
     print("preflight OK: el pipeline funciona de punta a punta")
 
 
-def ckpt_name(seed): return f"best_s{seed}.pt"
+def ckpt_name(seed, mode="v1"): return f"best_s{seed}.pt" if mode == "v1" else f"v2_best_s{seed}.pt"
 
 
 def stage_train(a):
@@ -161,19 +170,20 @@ def stage_train(a):
     pdir = pathlib.Path(a.persist) if a.persist else None
     per_seed = ((a.hours * 60 - 15) / a.seeds) if a.hours else 0  # 15 min de reserva para predecir/enviar
     for seed in range(a.seed0, a.seed0 + a.seeds):
-        name = ckpt_name(seed); state = name.replace(".pt", "_state.pt")
+        name = ckpt_name(seed, a.mode); state = name.replace(".pt", "_state.pt")
         if pdir and (pdir / f"done_s{seed}").exists() and not a.force:
             print(f"seed {seed} ya completada en {pdir}; se omite")
             shutil.copy(pdir / name, OUT / name); continue
         if pdir and not a.force:  # reanudar tras desconexion: ultimo estado completo + mejor checkpoint
             for f in (name, state):
                 if (pdir / f).exists() and not (OUT / f).exists(): shutil.copy(pdir / f, OUT / f)
-        cmd = [sys.executable, "src/aquatic.py", "train", "--epochs", a.epochs, "--bs", a.bs, "--unfreeze", a.unfreeze,
+        script = "src/v2.py" if a.mode == "v2" else "src/aquatic.py"
+        cmd = [sys.executable, script, "train", "--epochs", a.epochs, "--bs", a.bs, "--unfreeze", a.unfreeze,
                "--lr", a.lr, "--seed", seed, "--ckpt", f"outputs/{name}", "--workers", a.workers]
         if per_seed: cmd += ["--time-budget", int(per_seed)]
         if a.persist: cmd += ["--persist", a.persist]
         if a.force: cmd.append("--fresh")
-        elif a.resume or (OUT / name).exists(): cmd.append("--resume")
+        elif a.mode == "v1" and (a.resume or (OUT / name).exists()): cmd.append("--resume")
         sh(cmd)
         if pdir:
             pdir.mkdir(parents=True, exist_ok=True); shutil.copy(OUT / name, pdir / name)
@@ -183,10 +193,13 @@ def stage_train(a):
 
 def stage_predict(a):
     OUT.mkdir(exist_ok=True)
-    ck = sorted(str(p.relative_to(ROOT)) for p in OUT.glob("best_s*.pt"))
+    pats = {"v1": ["best_s*.pt"], "v2": ["v2_best_s*.pt"]}[a.mode] if not a.all_models else ["best_s*.pt", "v2_best_s*.pt"]
+    ck = sorted(str(p.relative_to(ROOT)) for pat in pats for p in OUT.glob(pat) if "_state" not in p.name)
     if not ck: sys.exit("No hay checkpoints en outputs/ (entrena primero)")
     sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", ",".join(ck)])
     persist(a, "submission.csv")
+    if a.persist:  # copia con nombre propio para no perder envios anteriores
+        shutil.copy(OUT / "submission.csv", pathlib.Path(a.persist) / f"submission_{'all' if a.all_models else a.mode}.csv")
 
 
 def stage_check(a):
@@ -203,7 +216,7 @@ def stage_submit(a):
     if not (os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")):
         sys.exit("Faltan KAGGLE_USERNAME / KAGGLE_KEY")
     sh(kaggle_cmd() + ["competitions", "submit", "-c", COMPETITION,
-        "-f", "outputs/submission.csv", "-m", a.message])
+        "-f", "outputs/submission.csv", "-m", (f"{a.preset} {a.mode}" if a.message == "auto" else a.message)])
 
 
 def persist(a, name):
@@ -221,6 +234,8 @@ if __name__ == "__main__":
     ap.add_argument("--hours", type=float, help="tope total de entrenamiento (horas); reparte entre semillas")
     ap.add_argument("--bs", type=int, default=64); ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed0", type=int, default=0); ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--mode", choices=["v1", "v2"], help="v1 = entrenamiento original; v2 = maestro en linea + aumentos")
+    ap.add_argument("--all-models", action="store_true", help="el ensamble incluye modelos v1 y v2")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")
@@ -228,6 +243,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     for k, v in PRESETS[a.preset].items():
         if getattr(a, k, None) is None: setattr(a, k, v)
+    if a.mode is None: a.mode = "v1"
     load_secrets(extra=(pathlib.Path(a.persist) / ".env") if a.persist else None)
     try: print('codigo en ejecucion, commit:', subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT, text=True).strip())
     except Exception: pass
