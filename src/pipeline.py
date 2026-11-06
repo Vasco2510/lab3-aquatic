@@ -171,7 +171,8 @@ def stage_train(a):
     per_seed = ((a.hours * 60 - 15) / a.seeds) if a.hours else 0  # 15 min de reserva para predecir/enviar
     for seed in range(a.seed0, a.seed0 + a.seeds):
         name = ckpt_name(seed, a.mode); state = name.replace(".pt", "_state.pt")
-        if pdir and (pdir / f"done_s{seed}").exists() and not a.force:
+        done = f"done_s{seed}" if a.mode == "v1" else f"done_v2_s{seed}"  # marcador propio por version
+        if pdir and (pdir / done).exists() and (pdir / name).exists() and not a.force:
             print(f"seed {seed} ya completada en {pdir}; se omite")
             shutil.copy(pdir / name, OUT / name); continue
         if pdir and not a.force:  # reanudar tras desconexion: ultimo estado completo + mejor checkpoint
@@ -187,7 +188,7 @@ def stage_train(a):
         sh(cmd)
         if pdir:
             pdir.mkdir(parents=True, exist_ok=True); shutil.copy(OUT / name, pdir / name)
-            if (OUT / (name + ".finished")).exists(): (pdir / f"done_s{seed}").touch()
+            if (OUT / (name + ".finished")).exists(): (pdir / done).touch()
             else: print(f"seed {seed} INCOMPLETA (tope de tiempo): la proxima corrida la continua desde su ultima epoca")
 
 
