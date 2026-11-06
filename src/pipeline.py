@@ -181,6 +181,7 @@ def stage_train(a):
         script = "src/v2.py" if a.mode == "v2" else "src/aquatic.py"
         cmd = [sys.executable, script, "train", "--epochs", a.epochs, "--bs", a.bs, "--unfreeze", a.unfreeze,
                "--lr", a.lr, "--seed", seed, "--ckpt", f"outputs/{name}", "--workers", a.workers]
+        if a.full and a.mode == "v2": cmd.append("--full")
         if per_seed: cmd += ["--time-budget", int(per_seed)]
         if a.persist: cmd += ["--persist", a.persist]
         if a.force: cmd.append("--fresh")
@@ -195,6 +196,10 @@ def stage_train(a):
 def stage_predict(a):
     OUT.mkdir(exist_ok=True)
     pats = {"v1": ["best_s*.pt"], "v2": ["v2_best_s*.pt"]}[a.mode] if not a.all_models else ["best_s*.pt", "v2_best_s*.pt"]
+    if a.persist:  # traer de Drive los checkpoints que falten (p. ej. runtime nuevo)
+        for pat in pats:
+            for f in pathlib.Path(a.persist).glob(pat):
+                if "_state" not in f.name and not (OUT / f.name).exists(): shutil.copy(f, OUT / f.name)
     ck = sorted(str(p.relative_to(ROOT)) for pat in pats for p in OUT.glob(pat) if "_state" not in p.name)
     if not ck: sys.exit("No hay checkpoints en outputs/ (entrena primero)")
     sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", ",".join(ck)])
@@ -237,6 +242,7 @@ if __name__ == "__main__":
     ap.add_argument("--seed0", type=int, default=0); ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--mode", choices=["v1", "v2"], help="v1 = entrenamiento original; v2 = maestro en linea + aumentos")
     ap.add_argument("--all-models", action="store_true", help="el ensamble incluye modelos v1 y v2")
+    ap.add_argument("--full", action="store_true", help="v2: entrenar con todos los datos (sin retener clusters)")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")

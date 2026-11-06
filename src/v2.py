@@ -109,6 +109,7 @@ def cmd_train(a):
     cb = np.load(a.codebook); cbn = F.normalize(torch.as_tensor(cb).float(), dim=1).to(dev)
     teacher, tdt = get_teacher(dev)
     tr, va = get_split(a, ids, imgs, teacher, tdt, dev)
+    if a.full: tr = tr + va  # entrenamiento final con todos los datos (val queda solo como monitor, ya no es independiente)
     print(f"v2 | train {len(tr)} val {len(va)} amp {dt} aug {a.aug} lam {a.lam}", flush=True)
     net = Net(cb, a.unfreeze).to(dev)
     bbp = [p for p in net.bb.parameters() if p.requires_grad]
@@ -120,7 +121,7 @@ def cmd_train(a):
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, [a.lr * 0.1, a.lr], total_steps=a.epochs * len(dl), pct_start=0.05)
     scaler = torch.amp.GradScaler(enabled=(dt == torch.float16 and dev == "cuda"))
     state_path = a.ckpt.replace(".pt", "_state.pt")
-    cfg = dict(v=2, epochs=a.epochs, unfreeze=a.unfreeze, bs=a.bs, lr=a.lr, seed=a.seed, lam=a.lam, aug=a.aug)
+    cfg = dict(v=2, epochs=a.epochs, unfreeze=a.unfreeze, bs=a.bs, lr=a.lr, seed=a.seed, lam=a.lam, aug=a.aug, full=a.full)
     best, ep_t, start = 0.0, 0, 0
     if os.path.exists(state_path) and not a.fresh:
         try:
@@ -165,7 +166,7 @@ def cmd_train(a):
         acc = c / max(n, 1); ep_t = time.time() - te
         print(f"[v2 seed {a.seed}] ep {ep+1}/{a.epochs} loss {loss.item():.3f} (ce {ce.item():.3f} cos {cs.item():.3f}) "
               f"val_acc {acc:.4f} ({ep_t/60:.1f} min)", flush=True)
-        if acc >= best:
+        if acc >= best or a.full:  # con --full se guarda la ultima epoca
             best = acc; torch.save(net.state_dict(), a.ckpt)
             if a.persist:
                 os.makedirs(a.persist, exist_ok=True); shutil.copy(a.ckpt, a.persist)
@@ -195,5 +196,5 @@ if __name__ == "__main__":
     p.add_argument("--persist", default=""); p.add_argument("--fresh", action="store_true")
     p.add_argument("--lam", type=float, default=1.0); p.add_argument("--aug", type=int, default=1)
     p.add_argument("--holdout", type=float, default=0.05); p.add_argument("--k", type=int, default=200)
-    p.add_argument("--max-steps", type=int, default=0); p.add_argument("--limit-imgs", type=int, default=0)
+    p.add_argument("--full", action="store_true"); p.add_argument("--max-steps", type=int, default=0); p.add_argument("--limit-imgs", type=int, default=0)
     a = ap.parse_args(); cmd_train(a)
