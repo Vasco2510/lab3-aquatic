@@ -129,7 +129,7 @@ def stage_data(a):
 
 
 def stage_labels(a):
-    if a.mode == "v2": print("v2 calcula las etiquetas en linea: se omite"); return
+    if a.mode in ("v2", "v3"): print("v2/v3 calculan las etiquetas en linea: se omite"); return
     if (DATA / "labels_train.csv").exists() and not a.force:
         print("labels ya existen, se omite"); return
     sh([sys.executable, "src/aquatic.py", "labels", "--train-dir", "data/train"])
@@ -142,6 +142,11 @@ PRESETS = {  # --preset; cualquier flag explicito lo sobreescribe
     # v2: maestro en linea + aumentos + validacion por clusters (src/v2.py)
     "v2smoke": dict(mode="v2", epochs=1, seeds=1, unfreeze=10),
     "v2":      dict(mode="v2", epochs=30, seeds=2, unfreeze=10, hours=6),
+    # v2b: receta distinta para diversificar el ensamble (aumentos con zoom/ruido, mas suavizado, mas peso al coseno)
+    # v3: igual que v2 pero con mascaras como las del test (agrupadas); es el arreglo principal
+    "v3smoke": dict(mode="v3", epochs=1, seeds=1, unfreeze=10),
+    "v3":      dict(mode="v3", epochs=36, seeds=3, unfreeze=10, hours=6),
+    "v2b":     dict(mode="v2", epochs=30, seeds=3, unfreeze=10, hours=5, aug=2, ls=0.1, lam=2.0, lr=7e-4, wd=0.1),
 }
 
 
@@ -149,9 +154,10 @@ def stage_preflight(a):
     """Prueba de humo automatica (segundos): 5 pasos de train + prediccion de 8 imagenes.
     Si algo esta roto, aborta ANTES de gastar horas de GPU."""
     OUT.mkdir(exist_ok=True)
-    if a.mode == "v2":
+    if a.mode in ("v2", "v3"):
         sh([sys.executable, "src/v2.py", "train", "--epochs", 1, "--max-steps", 3, "--bs", 8, "--unfreeze", a.unfreeze,
-            "--ckpt", "outputs/smoke.pt", "--workers", 2, "--limit-imgs", 200, "--k", 10, "--holdout", 0.2])
+            "--ckpt", "outputs/smoke.pt", "--workers", 2, "--limit-imgs", 200, "--k", 10, "--holdout", 0.2,
+            "--aug", a.aug if a.aug is not None else 1, "--mask", "walk" if a.mode == "v3" else "uniform"])
         (OUT / "split_v2.json").unlink(missing_ok=True)
     else:
         sh([sys.executable, "src/aquatic.py", "train", "--epochs", 1, "--max-steps", 5, "--bs", 8, "--unfreeze", a.unfreeze,
@@ -162,7 +168,7 @@ def stage_preflight(a):
     print("preflight OK: el pipeline funciona de punta a punta")
 
 
-def ckpt_name(seed, mode="v1"): return f"best_s{seed}.pt" if mode == "v1" else f"v2_best_s{seed}.pt"
+def ckpt_name(seed, mode="v1"): return f"best_s{seed}.pt" if mode == "v1" else f"{mode}_best_s{seed}.pt"
 
 
 def stage_train(a):
@@ -171,17 +177,21 @@ def stage_train(a):
     per_seed = ((a.hours * 60 - 15) / a.seeds) if a.hours else 0  # 15 min de reserva para predecir/enviar
     for seed in range(a.seed0, a.seed0 + a.seeds):
         name = ckpt_name(seed, a.mode); state = name.replace(".pt", "_state.pt")
-        done = f"done_s{seed}" if a.mode == "v1" else f"done_v2_s{seed}"  # marcador propio por version
+        done = f"done_s{seed}" if a.mode == "v1" else f"done_{a.mode}_s{seed}"  # marcador propio por version
         if pdir and (pdir / done).exists() and (pdir / name).exists() and not a.force:
             print(f"seed {seed} ya completada en {pdir}; se omite")
             shutil.copy(pdir / name, OUT / name); continue
         if pdir and not a.force:  # reanudar tras desconexion: ultimo estado completo + mejor checkpoint
             for f in (name, state):
                 if (pdir / f).exists() and not (OUT / f).exists(): shutil.copy(pdir / f, OUT / f)
-        script = "src/v2.py" if a.mode == "v2" else "src/aquatic.py"
+        script = "src/v2.py" if a.mode in ("v2", "v3") else "src/aquatic.py"
         cmd = [sys.executable, script, "train", "--epochs", a.epochs, "--bs", a.bs, "--unfreeze", a.unfreeze,
                "--lr", a.lr, "--seed", seed, "--ckpt", f"outputs/{name}", "--workers", a.workers]
-        if a.full and a.mode == "v2": cmd.append("--full")
+        if a.mode in ("v2", "v3"):
+            if a.mode == "v3": cmd += ["--mask", "walk"]
+            if a.full: cmd.append("--full")
+            for k in ("aug", "ls", "lam", "wd"):
+                if getattr(a, k) is not None: cmd += [f"--{k}", getattr(a, k)]
         if per_seed: cmd += ["--time-budget", int(per_seed)]
         if a.persist: cmd += ["--persist", a.persist]
         if a.force: cmd.append("--fresh")
@@ -195,7 +205,8 @@ def stage_train(a):
 
 def stage_predict(a):
     OUT.mkdir(exist_ok=True)
-    pats = {"v1": ["best_s*.pt"], "v2": ["v2_best_s*.pt"]}[a.mode] if not a.all_models else ["best_s*.pt", "v2_best_s*.pt"]
+    pats = [f"{('' if m == 'v1' else m + '_')}best_s*.pt" for m in
+            (a.use.split(",") if a.use else (["v1", "v2", "v3"] if a.all_models else [a.mode]))]
     if a.persist:  # traer de Drive los checkpoints que falten (p. ej. runtime nuevo)
         for pat in pats:
             for f in pathlib.Path(a.persist).glob(pat):
@@ -207,7 +218,7 @@ def stage_predict(a):
     # registro: cada envio guarda una copia con nombre propio (nunca se sobreescribe)
     import datetime, re
     seeds = "-".join(re.search(r"s(\d+)", pathlib.Path(c).stem).group(1) for c in ck)
-    kinds = "v1v2" if a.all_models else a.mode
+    kinds = a.use.replace(",", "") if a.use else ("v1v2v3" if a.all_models else a.mode)
     a.sub_tag = f"{datetime.datetime.now():%Y%m%d-%H%M}_{kinds}_n{len(ck)}_s{seeds}" + ("_full" if a.full else "")
     sdir = OUT / "submissions"; sdir.mkdir(exist_ok=True)
     shutil.copy(OUT / "submission.csv", sdir / f"{a.sub_tag}.csv")
@@ -250,9 +261,11 @@ if __name__ == "__main__":
     ap.add_argument("--preset", choices=list(PRESETS), default="full")
     ap.add_argument("--epochs", type=int); ap.add_argument("--unfreeze", type=int); ap.add_argument("--seeds", type=int)
     ap.add_argument("--hours", type=float, help="tope total de entrenamiento (horas); reparte entre semillas")
-    ap.add_argument("--bs", type=int, default=64); ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--bs", type=int, default=64); ap.add_argument("--lr", type=float)
+    ap.add_argument("--aug", type=int); ap.add_argument("--ls", type=float); ap.add_argument("--lam", type=float); ap.add_argument("--wd", type=float)
     ap.add_argument("--seed0", type=int, default=0); ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--mode", choices=["v1", "v2"], help="v1 = entrenamiento original; v2 = maestro en linea + aumentos")
+    ap.add_argument("--mode", choices=["v1", "v2", "v3"], help="v1 = original; v2 = maestro en linea + aumentos; v3 = v2 + mascaras tipo test")
+    ap.add_argument("--use", help="modelos para el ensamble, p. ej. v3 o v3,v2 (reemplaza a --all-models)")
     ap.add_argument("--all-models", action="store_true", help="el ensamble incluye modelos v1 y v2")
     ap.add_argument("--full", action="store_true", help="v2: entrenar con todos los datos (sin retener clusters)")
     ap.add_argument("--no-preflight", action="store_true")
@@ -263,6 +276,7 @@ if __name__ == "__main__":
     for k, v in PRESETS[a.preset].items():
         if getattr(a, k, None) is None: setattr(a, k, v)
     if a.mode is None: a.mode = "v1"
+    if a.lr is None: a.lr = 1e-3
     load_secrets(extra=(pathlib.Path(a.persist) / ".env") if a.persist else None)
     try: print('codigo en ejecucion, commit:', subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT, text=True).strip())
     except Exception: pass

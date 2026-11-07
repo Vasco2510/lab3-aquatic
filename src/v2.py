@@ -43,16 +43,63 @@ def prep_f(xf, mask):  # xf float [0,1]; mask (B,64) -> entrada normalizada con 
     return (xf - MEAN.to(xf.device)) / STD.to(xf.device)
 
 
-def augment(xf):
-    """Aumentos suaves: volteo horizontal y pequeno cambio de brillo/contraste (el maestro ve lo mismo)."""
+_PW = np.array([[0.16, 0.16, 0.16, 0.19, 0.18, 0.18, 0.2 , 0.16],
+          [0.16, 0.2 , 0.2 , 0.2 , 0.22, 0.19, 0.19, 0.16],
+          [0.2 , 0.21, 0.23, 0.23, 0.23, 0.22, 0.2 , 0.18],
+          [0.24, 0.25, 0.25, 0.25, 0.26, 0.24, 0.21, 0.2 ],
+          [0.22, 0.23, 0.23, 0.27, 0.27, 0.27, 0.22, 0.21],
+          [0.23, 0.24, 0.26, 0.28, 0.26, 0.27, 0.25, 0.2 ],
+          [0.21, 0.25, 0.24, 0.25, 0.25, 0.26, 0.25, 0.21],
+          [0.22, 0.23, 0.24, 0.25, 0.23, 0.23, 0.21, 0.2 ]]).ravel()  # frecuencia por celda de las mascaras del test (sesgo hacia el centro)
+_PW = _PW / _PW.sum()
+_NB = [(0, 1), (1, 0), (0, -1), (-1, 0)]
+
+
+def walk_masks(B, lo=8, hi=20, device="cpu", pc_lo=0.1, pc_hi=0.35):
+    """Mascaras con la misma estadistica que el test: agrupadas y algo centradas (parches vecinos 0.48,
+    componente mayor ~5.3). Cada parche nuevo se agrega junto a uno existente con prob. pc, o al azar si no."""
+    rs = np.random.default_rng(int(torch.randint(0, 2**31 - 1, (1,)).item()))
+    out = np.zeros((B, 64), bool)
+    for b in range(B):
+        n, pc, m = int(rs.integers(lo, hi + 1)), rs.uniform(pc_lo, pc_hi), out[b]
+        m[rs.choice(64, p=_PW)] = True; cnt = 1
+        while cnt < n:
+            if rs.random() < pc:
+                idx = np.flatnonzero(m); y, x = divmod(int(idx[rs.integers(len(idx))]), 8)
+                dy, dx = _NB[rs.integers(4)]; y, x = y + dy, x + dx
+                j = y * 8 + x if (0 <= y < 8 and 0 <= x < 8) else -1
+            else:
+                j = int(rs.choice(64, p=_PW))
+            if j >= 0 and not m[j]: m[j] = True; cnt += 1
+    return torch.as_tensor(out, device=device)
+
+
+def make_mask(a, B, device):
+    return walk_masks(B, device=device) if a.mask == "walk" else random_mask(B, device=device)
+
+
+def augment(xf, level=1):
+    """level 1: volteo horizontal + brillo/contraste suave. level 2: ademas recorte/zoom aleatorio y ruido leve
+    (el maestro etiqueta la imagen ya aumentada, asi que las etiquetas siguen siendo consistentes)."""
     B = xf.shape[0]
+    if level >= 2:
+        sc = torch.where(torch.rand(B, device=xf.device) < 0.5, torch.empty(B, device=xf.device).uniform_(0.75, 1.0),
+                         torch.ones(B, device=xf.device))
+        tx, ty = [(torch.rand(B, device=xf.device) * 2 - 1) * (1 - sc) for _ in range(2)]
+        th = torch.zeros(B, 2, 3, device=xf.device); th[:, 0, 0] = sc; th[:, 1, 1] = sc; th[:, 0, 2] = tx; th[:, 1, 2] = ty
+        xf = F.grid_sample(xf, F.affine_grid(th, xf.shape, align_corners=False), mode="bilinear",
+                           padding_mode="border", align_corners=False)
     flip = torch.rand(B, device=xf.device) < 0.5
     xf = torch.where(flip[:, None, None, None], xf.flip(3), xf)
     jit = (torch.rand(B, device=xf.device) < 0.5)[:, None, None, None]
     b = 1 + (torch.rand(B, 1, 1, 1, device=xf.device) - 0.5) * 0.2
     c = 1 + (torch.rand(B, 1, 1, 1, device=xf.device) - 0.5) * 0.2
     mu = xf.mean((1, 2, 3), keepdim=True)
-    return torch.where(jit, (((xf - mu) * c + mu) * b).clamp(0, 1), xf)
+    xf = torch.where(jit, (((xf - mu) * c + mu) * b).clamp(0, 1), xf)
+    if level >= 2:
+        nz = (torch.rand(B, device=xf.device) < 0.3)[:, None, None, None]
+        xf = torch.where(nz, (xf + torch.randn_like(xf) * 0.02).clamp(0, 1), xf)
+    return xf
 
 
 class DS(torch.utils.data.Dataset):
@@ -114,14 +161,14 @@ def cmd_train(a):
     net = Net(cb, a.unfreeze).to(dev)
     bbp = [p for p in net.bb.parameters() if p.requires_grad]
     hp = [p for n, p in net.named_parameters() if not n.startswith("bb.")]
-    opt = torch.optim.AdamW([{"params": bbp, "lr": a.lr * 0.1}, {"params": hp, "lr": a.lr}], weight_decay=0.05)
+    opt = torch.optim.AdamW([{"params": bbp, "lr": a.lr * 0.1}, {"params": hp, "lr": a.lr}], weight_decay=a.wd)
     dl = torch.utils.data.DataLoader(DS(tr, imgs), a.bs, shuffle=True, num_workers=a.workers, drop_last=True,
                                      persistent_workers=a.workers > 0)
     dv = torch.utils.data.DataLoader(DS(va, imgs), a.bs, num_workers=a.workers)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, [a.lr * 0.1, a.lr], total_steps=a.epochs * len(dl), pct_start=0.05)
     scaler = torch.amp.GradScaler(enabled=(dt == torch.float16 and dev == "cuda"))
     state_path = a.ckpt.replace(".pt", "_state.pt")
-    cfg = dict(v=2, epochs=a.epochs, unfreeze=a.unfreeze, bs=a.bs, lr=a.lr, seed=a.seed, lam=a.lam, aug=a.aug, full=a.full)
+    cfg = dict(v=2, epochs=a.epochs, unfreeze=a.unfreeze, bs=a.bs, lr=a.lr, seed=a.seed, lam=a.lam, aug=a.aug, full=a.full, ls=a.ls, wd=a.wd, mask=a.mask)
     best, ep_t, start = 0.0, 0, 0
     if os.path.exists(state_path) and not a.fresh:
         try:
@@ -140,13 +187,13 @@ def cmd_train(a):
         for bi, x in enumerate(dl):
             if a.max_steps and bi >= a.max_steps: break
             xf = x.to(dev, non_blocking=True).float() / 255
-            if a.aug: xf = augment(xf)
+            if a.aug: xf = augment(xf, a.aug)
             T, _ = teacher_embed(teacher, tdt, xf)
             lab = (T @ cbn.T).argmax(-1)
-            m = random_mask(len(xf), device=dev)
+            m = make_mask(a, len(xf), dev)
             with torch.autocast(dev, dtype=dt):
                 lg, z = net(prep_f(xf, m), return_emb=True)
-            ce = F.cross_entropy(lg[m].float(), lab[m], label_smoothing=0.05)
+            ce = F.cross_entropy(lg[m].float(), lab[m], label_smoothing=a.ls)
             cs = (1 - (z[m].float() * T[m]).sum(-1)).mean()
             loss = ce + a.lam * cs
             opt.zero_grad(set_to_none=True); scaler.scale(loss).backward()
@@ -159,7 +206,7 @@ def cmd_train(a):
                 if a.max_steps and vi >= a.max_steps: break
                 xf = x.to(dev).float() / 255
                 T, _ = teacher_embed(teacher, tdt, xf); lab = (T @ cbn.T).argmax(-1)
-                m = random_mask(len(xf), device=dev)
+                m = make_mask(a, len(xf), dev)
                 with torch.autocast(dev, dtype=dt):
                     lg = net(prep_f(xf, m))
                 c += (lg.argmax(-1)[m] == lab[m]).sum().item(); n += m.sum().item()
@@ -196,5 +243,5 @@ if __name__ == "__main__":
     p.add_argument("--persist", default=""); p.add_argument("--fresh", action="store_true")
     p.add_argument("--lam", type=float, default=1.0); p.add_argument("--aug", type=int, default=1)
     p.add_argument("--holdout", type=float, default=0.05); p.add_argument("--k", type=int, default=200)
-    p.add_argument("--full", action="store_true"); p.add_argument("--max-steps", type=int, default=0); p.add_argument("--limit-imgs", type=int, default=0)
+    p.add_argument("--full", action="store_true"); p.add_argument("--mask", choices=["uniform", "walk"], default="uniform"); p.add_argument("--ls", type=float, default=0.05); p.add_argument("--wd", type=float, default=0.05); p.add_argument("--max-steps", type=int, default=0); p.add_argument("--limit-imgs", type=int, default=0)
     a = ap.parse_args(); cmd_train(a)
