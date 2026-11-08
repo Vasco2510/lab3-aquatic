@@ -85,4 +85,4 @@ if __name__ == "__main__":
     p.add_argument("--test-dir", default="data/test"); p.add_argument("--target-csv", default="data/target.csv"); p.add_argument("--codebook", default="data/codebook.npy")
     p.add_argument("--ckpts", required=True); p.add_argument("--unfreeze", type=int, default=10); p.add_argument("--out", default="outputs/submission.csv")
     p.add_argument("--epochs", type=int, default=8); p.add_argument("--lr", type=float, default=2e-4); p.add_argument("--bb-lr", type=float, default=2e-5)
-    cmd_predict(p.parse_args())
+    cmd_predict(ap.parse_args())
