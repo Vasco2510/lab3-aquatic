@@ -33,10 +33,10 @@ def main():
     ap.add_argument("--n", type=int, default=120); ap.add_argument("--methods", default="student,telea,sd")
     ap.add_argument("--ckpts", default="outputs/v2_best_s0.pt,outputs/v2_best_s1.pt"); ap.add_argument("--unfreeze", type=int, default=10)
     ap.add_argument("--persist", default=""); ap.add_argument("--split", default="")
-    ap.add_argument("--sd-model", default="stabilityai/stable-diffusion-2-inpainting")
+    ap.add_argument("--sd-model", default="sd2-community/stable-diffusion-2-inpainting")
     ap.add_argument("--sd-steps", type=int, default=30); ap.add_argument("--sd-samples", type=int, default=1)
     ap.add_argument("--sd-guidance", type=float, default=7.5); ap.add_argument("--bs", type=int, default=4)
-    ap.add_argument("--out", default="outputs/diag.json")
+    ap.add_argument("--out", default="outputs/diag.json"); ap.add_argument("--test-dir", default="data/test")
     a = ap.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; methods = a.methods.split(","); res = {}
     cb = np.load(a.codebook); cbn = F.normalize(torch.as_tensor(cb).float(), dim=1).to(dev)
     imgs = list_images(a.train_dir)
@@ -65,6 +65,32 @@ def main():
         Pst = torch.cat(P); del nets; torch.cuda.empty_cache()
         res["student"] = acc(Pst.argmax(-1), lab, M); print(f"student ({len(ps)} modelos): {res['student']:.4f}", flush=True)
         res["mask_media"] = float(M.sum(1).float().mean())
+    if "shift" in methods:
+        # ¿el test se parece menos al train que nuestra validacion? (descriptor global del maestro, coseno al vecino mas cercano)
+        tr_ids = sorted(json.load(open(spf))["train"])
+
+        @torch.no_grad()
+        def desc(u8, masks=None):
+            out = []
+            for i in range(0, len(u8), 64):
+                xf = u8[i:i + 64].to(dev).float() / 255
+                if masks is not None: xf = xf * (1 - patch_mask_to_pixels(masks[i:i + 64].to(dev)))
+                out.append(F.normalize(v2.teacher_embed(teacher, tdt, xf)[1], dim=1))
+            return torch.cat(out)
+        Dtr = torch.cat([desc(torch.stack([load_img(imgs[j]) for j in tr_ids[i:i + 256]])) for i in range(0, len(tr_ids), 256)])
+        timgs = list_images(a.test_dir); Xt = torch.stack([load_img(timgs[k]) for k in sorted(timgs)])
+        sim = lambda D: (D @ Dtr.T).max(1).values.cpu()
+        s_val_m, s_val_u, s_test = sim(desc(X, M)), sim(desc(X)), sim(desc(Xt))
+        q = lambda t: [round(float(t.quantile(x)), 3) for x in (0.1, 0.5, 0.9)]
+        res["shift"] = dict(val_enmascarada=q(s_val_m), val_completa=q(s_val_u), test=q(s_test))
+        print(f"similitud al vecino mas cercano del train (p10, p50, p90): VAL enmascarada {q(s_val_m)} | VAL completa {q(s_val_u)} | TEST {q(s_test)}", flush=True)
+        if Pst is not None:
+            per = torch.stack([(Pst[i].argmax(-1)[M[i]] == lab[i][M[i]]).float().mean() for i in range(len(ids))])
+            order = torch.argsort(s_val_m); parts = torch.tensor_split(order, 4)
+            res["acc_por_cuartil_similitud"] = [(round(float(s_val_m[g].mean()), 3), round(float(per[g].mean()), 4)) for g in parts]
+            print("acierto de nuestros modelos por cuartil de similitud (de menos a mas parecido al train):", res["acc_por_cuartil_similitud"], flush=True)
+            lo = s_val_m <= s_test.median()
+            if lo.sum() > 5: res["acc_val_tan_poco_parecida_como_test"] = float(per[lo].mean()); print(f"acierto en validacion con similitud <= mediana del test ({int(lo.sum())} imgs): {res['acc_val_tan_poco_parecida_como_test']:.4f}")
     if "telea" in methods:
         import cv2
         out = []
@@ -103,7 +129,7 @@ def main():
                 res[f"fusion_w{w}"] = acc((Pst + w * votes / K).argmax(-1), lab, M); print(f"fusion student + {w} * sd: {res[f'fusion_w{w}']:.4f}")
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True); json.dump(res, open(a.out, "w"), indent=1)
     if a.persist: os.makedirs(a.persist, exist_ok=True); json.dump(res, open(os.path.join(a.persist, "diag.json"), "w"), indent=1)
-    print("\nRESUMEN", json.dumps({k: round(v, 4) for k, v in res.items()}))
+    print("\nRESUMEN", json.dumps(res))
 
 
 if __name__ == "__main__": main()
