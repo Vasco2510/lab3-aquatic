@@ -8,7 +8,7 @@
 Secretos (HF_TOKEN, KAGGLE_USERNAME, KAGGLE_KEY), en este orden de prioridad:
   1) variables de entorno  2) Colab Secrets  3) archivo .env en la raíz
 """
-import argparse, os, pathlib, shutil, subprocess, sys, zipfile
+import argparse, os, pathlib, shutil, subprocess, sys, time, zipfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DATA, OUT = ROOT / "data", ROOT / "outputs"
@@ -299,6 +299,9 @@ if __name__ == "__main__":
     ap.add_argument("--diag-samples", type=int, default=1); ap.add_argument("--diag-ckpts", default="v2_best_s0.pt,v2_best_s1.pt")
     ap.add_argument("--submit-file", help="nombre de un CSV de persist/submissions para enviar tal cual (ya revisado)")
     ap.add_argument("--force-submit", action="store_true")
+    ap.add_argument("--loop-hours", type=float, default=0, help="modo agente: repite ciclos (entrenar semillas nuevas, ensamblar, enviar) durante N horas")
+    ap.add_argument("--cycle-seeds", type=int, default=2, help="semillas nuevas por ciclo del agente")
+    ap.add_argument("--keep-submits", type=int, default=3, help="envios de Kaggle que el agente deja sin usar cada dia (limite 10)")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")
@@ -311,6 +314,52 @@ if __name__ == "__main__":
     load_secrets(extra=(pathlib.Path(a.persist) / ".env") if a.persist else None)
     try: print('codigo en ejecucion, commit:', subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT, text=True).strip())
     except Exception: pass
+    def run_stages(st):
+        for s_ in [x for x in STAGES if x in st]:
+            print(f"\n===== {s_} =====", flush=True); globals()["stage_" + s_](a)
+
+    def kaggle_rows():
+        import csv, io
+        r = subprocess.run(kaggle_cmd() + ["competitions", "submissions", "-c", COMPETITION, "-v"], cwd=ROOT, capture_output=True, text=True)
+        try: return list(csv.DictReader(io.StringIO(r.stdout)))
+        except Exception: return []
+
+    def next_seed():
+        import re
+        seeds = [int(re.search(r"_s(\d+)\.pt$", f.name).group(1)) for d in (OUT, pathlib.Path(a.persist) if a.persist else OUT)
+                 for f in d.glob(f"{a.mode}_best_s*.pt") if "_state" not in f.name]
+        return max(seeds) + 1 if seeds else a.seed0
+
+    if a.loop_hours:
+        import datetime
+        t_end = time.time() + a.loop_hours * 3600; cyc = fails = 0; log = (pathlib.Path(a.persist) / "loop_log.txt") if a.persist else (OUT / "loop_log.txt")
+        def note(msg):
+            line = f"{datetime.datetime.utcnow():%Y-%m-%d %H:%M} UTC | {msg}"; print(line, flush=True)
+            with open(log, "a", encoding="utf-8") as f: f.write(line + "\n")
+        note(f"agente iniciado: {a.loop_hours} h, {a.cycle_seeds} semillas por ciclo, modo {a.mode}, ensamble {a.use or a.mode}")
+        while True:
+            remain = (t_end - time.time()) / 3600; need = a.cycle_seeds * a.epochs * 2.8 / 60 + 0.35
+            if remain < need: note(f"quedan {remain:.1f} h (< {need:.1f} h de un ciclo): el agente termina"); break
+            if fails >= 3: note("3 ciclos seguidos con error: el agente se detiene para no gastar unidades"); break
+            a.seed0, a.seeds, a.hours, a.stages = next_seed(), a.cycle_seeds, need * 1.25, "data,train,predict,check"
+            today = f"{datetime.datetime.utcnow():%Y-%m-%d}"; used = sum(1 for r in kaggle_rows() if str(r.get("date", "")).startswith(today))
+            can_submit = used <= 10 - a.keep_submits - 1
+            st = a.stages.split(",") + (["submit"] if can_submit else []) + (["preflight"] if cyc == 0 and not a.no_preflight else [])
+            if "doctor" not in st: st.append("doctor")
+            cyc += 1; note(f"ciclo {cyc}: semillas {a.seed0}..{a.seed0 + a.seeds - 1}; envios hoy {used}/10 -> {'enviara' if can_submit else 'NO enviara (reserva)'}")
+            try:
+                run_stages(st); fails = 0
+                tag = getattr(a, "sub_tag", "?"); score = "sin enviar"
+                if can_submit:
+                    for _ in range(6):
+                        time.sleep(30)
+                        row = next((r for r in kaggle_rows() if r.get("description") == tag), None)
+                        if row and row.get("publicScore") not in (None, "", "None"): score = row["publicScore"]; break
+                note(f"ciclo {cyc} listo: {tag} -> puntaje publico {score}")
+            except (SystemExit, subprocess.CalledProcessError) as e:
+                fails += 1; note(f"ciclo {cyc} fallo ({type(e).__name__}: {e}); reintento en 2 min"); time.sleep(120)
+        sys.exit(0)
+
     st = a.stages.split(",") + (["submit"] if a.submit else [])
     if "train" in st and not a.no_preflight: st.append("preflight")
     if "doctor" not in st: st.append("doctor")
