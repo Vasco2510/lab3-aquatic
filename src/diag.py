@@ -10,7 +10,7 @@ Uso: python src/diag.py --n 120 --methods student,telea,sd --persist DIR
 import argparse, json, os, sys, time
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import aquatic, v2
+import aquatic, v2, adapt as AD
 from aquatic import Net, list_images, load_img, prep, patch_mask_to_pixels
 
 PROMPT = "underwater photograph, seabed, rocks, corals, sand, marine life, natural light, sharp, detailed"
@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--sd-model", default="sd2-community/stable-diffusion-2-inpainting")
     ap.add_argument("--sd-steps", type=int, default=30); ap.add_argument("--sd-samples", type=int, default=1)
     ap.add_argument("--sd-guidance", type=float, default=7.5); ap.add_argument("--bs", type=int, default=4)
-    ap.add_argument("--out", default="outputs/diag.json"); ap.add_argument("--test-dir", default="data/test"); ap.add_argument("--target-csv", default="data/target.csv")
+    ap.add_argument("--out", default="outputs/diag.json"); ap.add_argument("--test-dir", default="data/test"); ap.add_argument("--target-csv", default="data/target.csv"); ap.add_argument("--adapt-epochs", type=int, default=8)
     a = ap.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; methods = a.methods.split(","); res = {}
     cb = np.load(a.codebook); cbn = F.normalize(torch.as_tensor(cb).float(), dim=1).to(dev)
     imgs = list_images(a.train_dir)
@@ -50,7 +50,7 @@ def main():
     lab = torch.cat([codes_of(teacher, tdt, cbn, X[i:i + 16], dev) for i in range(0, len(ids), 16)]).cpu()
     mask_f = patch_mask_to_pixels(M).bool()                                  # (N,1,256,256)
     Pst = None
-    if {"student", "fusion", "sd", "conf", "shift"} & set(methods):
+    if {"student", "fusion", "sd", "conf", "shift", "hard", "adapt"} & set(methods):
         ps = [p for p in a.ckpts.split(",") if os.path.exists(p)]; assert ps, f"no existen {a.ckpts}"
         nets = []
         for p in ps:
@@ -112,6 +112,19 @@ def main():
         est = float(tabla[b(ct_)].mean())
         res["conf"] = dict(conf_media_val=float(cv_.mean()), acc_val=float(cp_.mean()), conf_media_test=float(ct_.mean()), acierto_estimado_test=est)
         print(f"confianza media: VAL {float(cv_.mean()):.3f} (acierto real {float(cp_.mean()):.3f}) | TEST {float(ct_.mean()):.3f} -> acierto estimado en test {est:.3f}", flush=True)
+    if "hard" in methods:
+        # ¿lo dificil son las ESCENAS del test o el CONTENIDO que ocultan las mascaras reales?
+        import pandas as pd
+        tg = pd.read_csv(a.target_csv); timgs = list_images(a.test_dir); n = min(len(ids), len(tg))
+        Xt2 = torch.stack([load_img(timgs[str(k)]) for k in tg["ID"][:n]]); Mt2 = torch.zeros(n, 64, dtype=torch.bool)
+        for j, t in enumerate(tg["target"].astype(str)[:n]): Mt2[j, [int(p) for p in t.split()]] = True
+        r = torch.rand(n, 64, generator=torch.Generator().manual_seed(7)); r[Mt2] = 2.0; E = r.argsort(1).argsort(1) < 6   # 6 parches visibles al azar
+        P1 = AD.ensemble_probs(nets_c, X[:n], Mt2, dev); P2 = AD.ensemble_probs(nets_c, X[:n], Mt2 | E, dev); P3 = AD.ensemble_probs(nets_c, Xt2, Mt2 | E, dev)
+        c = lambda P, m: float(P.max(-1).values[m].mean())
+        hd = dict(val_con_mascaras_reales_conf=c(P1, Mt2), val_con_mascaras_reales_acierto=acc(P1.argmax(-1), lab[:n], Mt2),
+                  val_extra_conf=c(P2, E), val_extra_acierto=acc(P2.argmax(-1), lab[:n], E), test_extra_conf=c(P3, E))
+        res["hard"] = hd; print("VAL con las mascaras REALES del test: confianza %.3f acierto %.3f (comparar con VAL mascara tipo test y con TEST real 0.375)" % (hd["val_con_mascaras_reales_conf"], hd["val_con_mascaras_reales_acierto"]), flush=True)
+        print("parches visibles extra ocultados: VAL confianza %.3f (acierto %.3f) | TEST confianza %.3f  (TEST < VAL => las escenas del test son mas dificiles)" % (hd["val_extra_conf"], hd["val_extra_acierto"], hd["test_extra_conf"]), flush=True)
     if "dup" in methods:
         # ¿hay imagenes del test (o partes) identicas a las del train? hash exacto de parches visibles de 32x32
         import pandas as pd, collections
@@ -170,6 +183,14 @@ def main():
         if Pst is not None:
             for w in (0.1, 0.2, 0.3, 0.5, 0.8, 1.5):
                 res[f"fusion_w{w}"] = acc((Pst + w * votes / K).argmax(-1), lab, M); print(f"fusion student + {w} * sd: {res[f'fusion_w{w}']:.4f}")
+    if "adapt" in methods:
+        # adaptacion sin etiquetas: se mide en VALIDACION (etiquetas reales conocidas) tratando las imagenes enmascaradas como si fueran el test
+        Tc = AD.pseudo_codes(teacher, tdt, cbn, X, M, dev); fid = float((Tc[~M] == lab[~M]).float().mean())
+        base = acc(Pst.argmax(-1), lab, M); print(f"etiquetas aproximadas del maestro vs reales en parches visibles: {fid:.3f}", flush=True)
+        for k_, n_ in enumerate(nets_c): AD.adapt_net(n_, X, M, Tc, dev, epochs=a.adapt_epochs, seed=k_, log=lambda t_: print(t_, flush=True))
+        Pad = AD.ensemble_probs(nets_c, X, M, dev); ad = acc(Pad.argmax(-1), lab, M)
+        res["adapt"] = dict(fidelidad_etiquetas=fid, base=base, adaptado=ad, ganancia=ad - base, epocas=a.adapt_epochs)
+        print(f"ADAPTACION: base {base:.4f} -> adaptado {ad:.4f} (ganancia {ad - base:+.4f}) con {a.adapt_epochs} epocas sobre {len(ids)} imagenes", flush=True)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True); json.dump(res, open(a.out, "w"), indent=1)
     if a.persist: os.makedirs(a.persist, exist_ok=True); json.dump(res, open(os.path.join(a.persist, "diag.json"), "w"), indent=1)
     print("\nRESUMEN", json.dumps(res))

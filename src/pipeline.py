@@ -213,7 +213,8 @@ def stage_predict(a):
                 if "_state" not in f.name and not (OUT / f.name).exists(): shutil.copy(f, OUT / f.name)
     ck = sorted(str(p.relative_to(ROOT)) for pat in pats for p in OUT.glob(pat) if "_state" not in p.name)
     if not ck: sys.exit("No hay checkpoints en outputs/ (entrena primero)")
-    sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", ",".join(ck)])
+    if a.adapt: sh([sys.executable, "src/adapt.py", "predict", "--ckpts", ",".join(ck), "--epochs", a.adapt])
+    else: sh([sys.executable, "src/aquatic.py", "predict", "--ckpts", ",".join(ck)])
     persist(a, "submission.csv")
     # registro: cada envio guarda una copia con nombre propio (nunca se sobreescribe)
     import datetime, re
@@ -243,7 +244,7 @@ def stage_diag(a):
             f = pathlib.Path(a.persist) / n
             if f.exists() and not (OUT / n).exists(): shutil.copy(f, OUT / n)
     sh([sys.executable, "src/diag.py", "--n", a.diag_n, "--methods", a.diag_methods, "--sd-samples", a.diag_samples,
-        "--ckpts", ",".join(f"outputs/{n}" for n in names)] + (["--persist", a.persist] if a.persist else []))
+        "--ckpts", ",".join(f"outputs/{n}" for n in names), "--adapt-epochs", a.diag_adapt_epochs] + (["--persist", a.persist] if a.persist else []))
 
 
 def stage_check(a):
@@ -302,6 +303,8 @@ if __name__ == "__main__":
     ap.add_argument("--loop-hours", type=float, default=0, help="modo agente: repite ciclos (entrenar semillas nuevas, ensamblar, enviar) durante N horas")
     ap.add_argument("--cycle-seeds", type=int, default=2, help="semillas nuevas por ciclo del agente")
     ap.add_argument("--keep-submits", type=int, default=3, help="envios de Kaggle que el agente deja sin usar cada dia (limite 10)")
+    ap.add_argument("--diag-adapt-epochs", type=int, default=8)
+    ap.add_argument("--adapt", type=int, default=0, help="predict: adaptar cada modelo N epocas a las imagenes del test (sin etiquetas) antes de predecir")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")
