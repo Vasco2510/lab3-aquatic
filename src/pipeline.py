@@ -20,7 +20,7 @@ DRIVE_IDS = {  # carpeta pública del curso
     "codebook.npy": "1Hhjxp23rHuciFSItJiLBP2wfA_AK2Nyw",
     "dino_vq.py": "1SjiA9eAcG8LrW-I6KOtiraJjbjwag8h0",
 }
-STAGES = ["doctor", "data", "labels", "preflight", "train", "predict", "check", "submit"]
+STAGES = ["doctor", "data", "labels", "diag", "preflight", "train", "predict", "check", "submit"]
 
 
 def load_secrets(names=("HF_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY"), extra=None):
@@ -67,7 +67,7 @@ def stage_doctor(a):
     def chk(name, cond, hint=""):
         print(("  OK    " if cond else "  FALLA ") + name + ("" if cond else f"  -> {hint}"))
         if not cond: bad.append(name)
-    needs_gpu = bool({"labels", "preflight", "train", "predict"} & set(a.stages.split(",")))
+    needs_gpu = bool({"labels", "diag", "preflight", "train", "predict"} & set(a.stages.split(",")))
     if needs_gpu:
         import torch
         chk("GPU disponible", torch.cuda.is_available(), "Runtime con GPU (cuenta Colab Pro)")
@@ -228,20 +228,47 @@ def stage_predict(a):
         pd_ = pathlib.Path(a.persist) / "submissions"; pd_.mkdir(parents=True, exist_ok=True)
         shutil.copy(sdir / f"{a.sub_tag}.csv", pd_ / f"{a.sub_tag}.csv")
         with open(pd_ / "registro.csv", "a", encoding="utf-8") as f: f.write(line)
+    a.sub_name = f"{a.sub_tag}.csv"
     print(f"registro: submissions/{a.sub_tag}.csv")
+
+
+def stage_diag(a):
+    """Experimento corto: student vs inpainting clasico vs Stable Diffusion + maestro, en validacion con mascaras tipo test."""
+    OUT.mkdir(exist_ok=True)
+    if "sd" in a.diag_methods.split(","): sh([sys.executable, "-m", "pip", "install", "-q", "diffusers>=0.30", "accelerate", "opencv-python-headless"])
+    else: sh([sys.executable, "-m", "pip", "install", "-q", "opencv-python-headless"])
+    names = [n for n in a.diag_ckpts.split(",") if n]
+    if a.persist:
+        for n in names + ["split_v2.json"]:
+            f = pathlib.Path(a.persist) / n
+            if f.exists() and not (OUT / n).exists(): shutil.copy(f, OUT / n)
+    sh([sys.executable, "src/diag.py", "--n", a.diag_n, "--methods", a.diag_methods, "--sd-samples", a.diag_samples,
+        "--ckpts", ",".join(f"outputs/{n}" for n in names)] + (["--persist", a.persist] if a.persist else []))
 
 
 def stage_check(a):
     import pandas as pd
+    if a.submit_file and a.persist:  # revisar un CSV guardado en Drive (el mismo que luego se envia)
+        shutil.copy(pathlib.Path(a.persist) / "submissions" / a.submit_file, OUT / "submission.csv"); a.sub_name = a.submit_file
     sub, tg = pd.read_csv(OUT / "submission.csv"), pd.read_csv(DATA / "target.csv")
     exp = sum(len(str(t).split()) for t in tg["target"])
     assert len(sub) == exp, f"filas {len(sub)} != esperadas {exp}"
     assert not sub["Id"].duplicated().any(), "Ids duplicados"
     assert sub["Target"].between(0, 1023).all(), "Target fuera de 0..1023"
     print(f"submission OK: {len(sub)} filas; clases distintas usadas: {sub['Target'].nunique()}")
+    # guarda anti-bugs: coincidencia con el ultimo envio guardado (dos modelos sanos coinciden en bastante mas del 30%)
+    prev = sorted((pathlib.Path(a.persist) / "submissions").glob("*.csv")) if a.persist else []
+    prev = [f for f in prev if f.name != getattr(a, "sub_name", "")]
+    if prev:
+        ref = pd.read_csv(prev[-1]).set_index("Id")["Target"]; cur = sub.set_index("Id")["Target"]
+        ag = float((cur == ref.reindex(cur.index)).mean()); print(f"coincidencia con {prev[-1].name}: {ag:.1%}")
+        a.agreement = ag
+        if ag < 0.30 and a.submit and not a.force_submit:
+            sys.exit("GUARDA: este CSV casi no coincide con el envio anterior (posible bug). No se envia. Usa --force-submit si es intencional.")
 
 
 def stage_submit(a):
+    if a.submit_file: a.sub_tag = pathlib.Path(a.submit_file).stem  # el CSV ya fue copiado y revisado en la etapa check
     if not (os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY")):
         sys.exit("Faltan KAGGLE_USERNAME / KAGGLE_KEY")
     sh(kaggle_cmd() + ["competitions", "submit", "-c", COMPETITION,
@@ -268,6 +295,10 @@ if __name__ == "__main__":
     ap.add_argument("--use", help="modelos para el ensamble, p. ej. v3 o v3,v2 (reemplaza a --all-models)")
     ap.add_argument("--all-models", action="store_true", help="el ensamble incluye modelos v1 y v2")
     ap.add_argument("--full", action="store_true", help="v2: entrenar con todos los datos (sin retener clusters)")
+    ap.add_argument("--diag-n", type=int, default=120); ap.add_argument("--diag-methods", default="student,telea,sd")
+    ap.add_argument("--diag-samples", type=int, default=1); ap.add_argument("--diag-ckpts", default="v2_best_s0.pt,v2_best_s1.pt")
+    ap.add_argument("--submit-file", help="nombre de un CSV de persist/submissions para enviar tal cual (ya revisado)")
+    ap.add_argument("--force-submit", action="store_true")
     ap.add_argument("--no-preflight", action="store_true")
     ap.add_argument("--resume", action="store_true"); ap.add_argument("--force", action="store_true")
     ap.add_argument("--persist", default=None, help="carpeta (Drive) donde copiar best.pt y submission.csv")
