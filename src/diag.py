@@ -36,7 +36,7 @@ def main():
     ap.add_argument("--sd-model", default="sd2-community/stable-diffusion-2-inpainting")
     ap.add_argument("--sd-steps", type=int, default=30); ap.add_argument("--sd-samples", type=int, default=1)
     ap.add_argument("--sd-guidance", type=float, default=7.5); ap.add_argument("--bs", type=int, default=4)
-    ap.add_argument("--out", default="outputs/diag.json"); ap.add_argument("--test-dir", default="data/test")
+    ap.add_argument("--out", default="outputs/diag.json"); ap.add_argument("--test-dir", default="data/test"); ap.add_argument("--target-csv", default="data/target.csv")
     a = ap.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; methods = a.methods.split(","); res = {}
     cb = np.load(a.codebook); cbn = F.normalize(torch.as_tensor(cb).float(), dim=1).to(dev)
     imgs = list_images(a.train_dir)
@@ -50,7 +50,7 @@ def main():
     lab = torch.cat([codes_of(teacher, tdt, cbn, X[i:i + 16], dev) for i in range(0, len(ids), 16)]).cpu()
     mask_f = patch_mask_to_pixels(M).bool()                                  # (N,1,256,256)
     Pst = None
-    if "student" in methods or "fusion" in methods or "sd" in methods:
+    if {"student", "fusion", "sd", "conf", "shift"} & set(methods):
         ps = [p for p in a.ckpts.split(",") if os.path.exists(p)]; assert ps, f"no existen {a.ckpts}"
         nets = []
         for p in ps:
@@ -62,7 +62,7 @@ def main():
                 for n_ in nets:
                     with torch.autocast(dev, dtype=torch.bfloat16): pr = pr + n_(prep(x, m)).float().softmax(-1)
                 P.append((pr / len(nets)).cpu())
-        Pst = torch.cat(P); del nets; torch.cuda.empty_cache()
+        Pst = torch.cat(P); nets_c = nets; torch.cuda.empty_cache()
         res["student"] = acc(Pst.argmax(-1), lab, M); print(f"student ({len(ps)} modelos): {res['student']:.4f}", flush=True)
         res["mask_media"] = float(M.sum(1).float().mean())
     if "shift" in methods:
@@ -91,6 +91,49 @@ def main():
             print("acierto de nuestros modelos por cuartil de similitud (de menos a mas parecido al train):", res["acc_por_cuartil_similitud"], flush=True)
             lo = s_val_m <= s_test.median()
             if lo.sum() > 5: res["acc_val_tan_poco_parecida_como_test"] = float(per[lo].mean()); print(f"acierto en validacion con similitud <= mediana del test ({int(lo.sum())} imgs): {res['acc_val_tan_poco_parecida_como_test']:.4f}")
+    if "conf" in methods:
+        # confianza de los modelos sobre los parches reales del test: si estan calibrados, estima el acierto sin etiquetas
+        import pandas as pd
+        tg = pd.read_csv(a.target_csv); timgs = list_images(a.test_dir); Pt, mt = [], []
+        with torch.no_grad():
+            for i in range(0, len(tg), 16):
+                rows = tg.iloc[i:i + 16]; x = torch.stack([load_img(timgs[str(k)]) for k in rows["ID"]]).to(dev)
+                m = torch.zeros(len(rows), 64, dtype=torch.bool, device=dev)
+                for j, t in enumerate(rows["target"].astype(str)): m[j, [int(p) for p in t.split()]] = True
+                pr = 0
+                for n_ in nets_c:
+                    with torch.autocast(dev, dtype=torch.bfloat16): pr = pr + n_(prep(x, m)).float().softmax(-1)
+                Pt.append((pr / len(nets_c)).cpu()); mt.append(m.cpu())
+        Pt, mt = torch.cat(Pt), torch.cat(mt)
+        cv_, cp_ = Pst.max(-1).values[M], (Pst.argmax(-1) == lab)[M].float()     # confianza y acierto en val
+        ct_ = Pt.max(-1).values[mt]
+        edges = torch.quantile(cv_, torch.linspace(0, 1, 11)); b = lambda c: torch.bucketize(c, edges[1:-1])
+        tabla = torch.stack([cp_[b(cv_) == k].mean() for k in range(10)])
+        est = float(tabla[b(ct_)].mean())
+        res["conf"] = dict(conf_media_val=float(cv_.mean()), acc_val=float(cp_.mean()), conf_media_test=float(ct_.mean()), acierto_estimado_test=est)
+        print(f"confianza media: VAL {float(cv_.mean()):.3f} (acierto real {float(cp_.mean()):.3f}) | TEST {float(ct_.mean()):.3f} -> acierto estimado en test {est:.3f}", flush=True)
+    if "dup" in methods:
+        # ¿hay imagenes del test (o partes) identicas a las del train? hash exacto de parches visibles de 32x32
+        import pandas as pd, collections
+        tr_all = sorted(imgs); H = {}
+        for j in tr_all:
+            p = load_img(imgs[j]).permute(1, 2, 0).numpy().reshape(8, 32, 8, 32, 3).transpose(0, 2, 1, 3, 4).reshape(64, -1)
+            for k in range(64): H.setdefault(hash(p[k].tobytes()), (j, k))
+        tg = pd.read_csv(a.target_csv); timgs = list_images(a.test_dir); n_img = n_ge = n_full = 0; cnt_list = []; donors = {}
+        for i_, t in zip(tg["ID"].astype(str), tg["target"].astype(str)):
+            hid = {int(p) for p in t.split()}
+            p = load_img(timgs[i_]).permute(1, 2, 0).numpy().reshape(8, 32, 8, 32, 3).transpose(0, 2, 1, 3, 4).reshape(64, -1)
+            c = collections.Counter(); vis = 0
+            for k in range(64):
+                if k in hid: continue
+                vis += 1; h = H.get(hash(p[k].tobytes()))
+                if h and p[k].max() > 0: c[h[0]] += 1
+            top = c.most_common(1)[0] if c else (None, 0); cnt_list.append(top[1]); n_img += 1
+            n_ge += top[1] >= 8; n_full += top[1] >= 0.8 * vis
+            if top[1] >= 8: donors[i_] = top[0]
+        res["dup"] = dict(imagenes_test=n_img, con_8_o_mas_parches_identicos=n_ge, casi_completas=n_full)
+        print(f"duplicados: de {n_img} imagenes de test, {n_ge} comparten >= 8 parches visibles idénticos con UNA imagen del train; {n_full} casi completas (>=80% de lo visible)", flush=True)
+        json.dump(donors, open(a.out.replace(".json", "_donantes.json"), "w"))
     if "telea" in methods:
         import cv2
         out = []
